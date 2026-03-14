@@ -1,0 +1,17 @@
+pydantic-settings
+email-validator
+fastapi
+uvicorn[standard]
+motor
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
+python-multipart
+python-dotenv
+pymongo
+langchain
+langgraph
+reportlab
+groq
+httpx
+PyGithub
