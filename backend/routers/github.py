@@ -20,6 +20,7 @@ from ..agents.monitoring_agent import (
     fetch_github_activity,
     build_activity_events,
 )
+from ..agents.graph import run_graph_for_workspace
 
 
 router = APIRouter(prefix="/api", tags=["github"])
@@ -353,42 +354,53 @@ async def github_webhook(request: Request):
 
     payload = json.loads(body.decode("utf-8"))
 
-    if event == "pull_request":
-        action = payload.get("action")
-        pr = payload.get("pull_request") or {}
-        merged = pr.get("merged")
-        if action == "closed" and merged:
-            # Try to mark linked tasks as done.
-            repo = payload.get("repository") or {}
-            full_name = repo.get("full_name")
-            await _mark_tasks_done_for_pr(full_name, pr)
+    repo = payload.get("repository") or {}
+    full_name = repo.get("full_name")
+    github_events = _extract_github_events_from_webhook(event, payload)
 
-    # Other events (push, issues) can be handled similarly later.
+    if full_name and github_events:
+        db = get_db()
+        workspaces = db["workspaces"]
+        cursor = workspaces.find({"github.repo_full_name": full_name})
+        async for workspace in cursor:
+            await run_graph_for_workspace(str(workspace["_id"]), github_events=github_events)
+
     return {"status": "ok"}
 
 
-async def _mark_tasks_done_for_pr(repo_full_name: str | None, pr: Dict[str, Any]):
-    """
-    Very simple mapping: if any task has github_pr set to this PR number, mark it done.
-    """
-    if not repo_full_name:
-        return
-
-    db = get_db()
-    workspaces = db["workspaces"]
-    # Find all workspaces using this repo
-    cursor = workspaces.find({"github.repo_full_name": repo_full_name})
-    async for w in cursor:
-        tasks = w.get("tasks") or []
-        pr_number = pr.get("number")
-        updated = False
-        for task in tasks:
-            if task.get("github_pr") == pr_number:
-                task["status"] = "done"
-                updated = True
-        if updated:
-            await workspaces.update_one(
-                {"_id": w["_id"]},
-                {"$set": {"tasks": tasks}},
+def _extract_github_events_from_webhook(event: str | None, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if event == "push":
+        events: List[Dict[str, Any]] = []
+        for commit in payload.get("commits") or []:
+            events.append(
+                {
+                    "id": f"github:commit:{(commit.get('id') or '')[:12]}",
+                    "type": "commit",
+                    "sha": (commit.get("id") or "")[:12],
+                    "message": commit.get("message") or "",
+                    "user": (commit.get("author") or {}).get("username") or (commit.get("author") or {}).get("name"),
+                    "timestamp": commit.get("timestamp"),
+                }
             )
+        return events
 
+    if event == "pull_request":
+        pr = payload.get("pull_request") or {}
+        return [
+            {
+                "id": f"github:pr:{pr.get('number')}:{'merged' if pr.get('merged') else pr.get('state')}",
+                "type": "pull_request",
+                "number": pr.get("number"),
+                "title": pr.get("title"),
+                "message": pr.get("title"),
+                "user": (pr.get("user") or {}).get("login"),
+                "state": pr.get("state"),
+                "merged": pr.get("merged"),
+                "timestamp": pr.get("updated_at") or pr.get("created_at"),
+                "created_at": pr.get("created_at"),
+                "closed_at": pr.get("closed_at"),
+                "html_url": pr.get("html_url"),
+            }
+        ]
+
+    return []

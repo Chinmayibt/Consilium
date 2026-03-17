@@ -13,6 +13,8 @@ from ..agents.requirements_agent import run_requirements_agent
 from ..agents.planning_agent import run_planning_agent
 from ..database import get_db
 from ..dependencies import get_current_user
+from ..services.notification_service import trim_activity_log, trim_notifications
+from ..services.kanban_service import KANBAN_STATUSES, build_kanban
 
 
 router = APIRouter(prefix="/api/workspaces", tags=["requirements"])
@@ -134,29 +136,6 @@ async def save_workspace_prd(
     return None
 
 
-# Kanban columns per spec: Backlog, Todo, In Progress, Review, Blocked, Done
-KANBAN_STATUSES = ("backlog", "todo", "in_progress", "review", "blocked", "done")
-
-
-def _build_kanban(tasks: list) -> Dict[str, Any]:
-    """Group tasks by status for kanban columns."""
-    columns: Dict[str, list] = {
-        "backlog": [],
-        "todo": [],
-        "in_progress": [],
-        "review": [],
-        "blocked": [],
-        "done": [],
-    }
-    for t in tasks:
-        status = (t.get("status") or "todo").lower()
-        if status in columns:
-            columns[status].append(t)
-        else:
-            columns["todo"].append(t)
-    return columns
-
-
 class FinalizePrdResponse(BaseModel):
     prd_status: str
     roadmap: Dict[str, Any] | None
@@ -208,7 +187,7 @@ async def finalize_workspace_prd(
     print("SAVING ROADMAP:", roadmap)
 
     tasks = plan.get("tasks") or []
-    kanban = _build_kanban(tasks)
+    kanban = build_kanban(tasks)
 
     await workspaces.update_one(
         {"_id": oid},
@@ -226,12 +205,12 @@ async def finalize_workspace_prd(
     updated = await workspaces.find_one({"_id": oid})
     print("DATABASE ROADMAP:", updated.get("roadmap"))
 
-    # Run one orchestrator tick (monitoring, etc.) in background
+    # Run the project-management graph once so monitoring/risk/replanning state is initialized.
     try:
-        from ..agents.orchestrator.project_orchestrator import start_project_graph
-        await start_project_graph(workspace_id)
+        from ..agents.graph import run_graph_for_workspace
+        await run_graph_for_workspace(workspace_id)
     except Exception as e:
-        print("Orchestrator tick failed:", e)
+        print("Project graph run failed:", e)
 
     return FinalizePrdResponse(prd_status="final", roadmap=roadmap)
 
@@ -455,7 +434,7 @@ async def get_workspace_kanban(
     members_raw = workspace.get("members") or []
     members = await _enrich_members_from_users(members_raw)
     tasks = _enrich_tasks_with_members(tasks, members)
-    kanban = _build_kanban(tasks)
+    kanban = build_kanban(tasks)
     return KanbanResponse(kanban=kanban, tasks=tasks)
 
 
@@ -516,6 +495,7 @@ async def update_workspace_task(
 
 class NotificationsResponse(BaseModel):
     notifications: List[Dict[str, Any]]
+    unread_count: int = 0
 
 
 @router.get(
@@ -536,8 +516,14 @@ async def get_workspace_notifications(
     workspace = await workspaces.find_one({"_id": oid})
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    notifications = workspace.get("notifications") or []
-    return NotificationsResponse(notifications=notifications)
+    user_id = str(current_user["_id"])
+    notifications = [
+        item
+        for item in trim_notifications(workspace.get("notifications") or [])
+        if item.get("user_id") in (None, "", user_id)
+    ]
+    unread_count = sum(1 for item in notifications if not item.get("read"))
+    return NotificationsResponse(notifications=notifications, unread_count=unread_count)
 
 
 class MarkNotificationsReadRequest(BaseModel):
@@ -563,9 +549,12 @@ async def mark_notifications_read(
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     notifications = list(workspace.get("notifications") or [])
+    user_id = str(current_user["_id"])
     ids_to_mark = set(payload.notification_ids or [])
     for i, n in enumerate(notifications):
         if isinstance(n, dict):
+            if n.get("user_id") not in (None, "", user_id):
+                continue
             nid = n.get("id") or str(i)
             if not ids_to_mark or nid in ids_to_mark:
                 n["read"] = True
@@ -594,8 +583,9 @@ async def get_workspace_activity(
     workspace = await workspaces.find_one({"_id": oid})
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    activity_log = workspace.get("activity_log") or []
-    return ActivityResponse(activity_log=sorted(activity_log, key=lambda x: x.get("timestamp", ""), reverse=True))
+    activity_log = trim_activity_log(workspace.get("activity_log") or [])
+    activity_log = sorted(activity_log, key=lambda x: x.get("timestamp", ""), reverse=True)
+    return ActivityResponse(activity_log=activity_log)
 
 
 class RisksResponse(BaseModel):
@@ -624,7 +614,8 @@ async def get_workspace_risks(
     workspace = await workspaces.find_one({"_id": oid})
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    risks = workspace.get("risks") or []
+    risks = list(workspace.get("risks") or [])
+    risks = sorted(risks, key=lambda x: x.get("created_at", ""), reverse=True)
     return RisksResponse(risks=risks)
 
 
@@ -636,4 +627,3 @@ async def _run_agent_async(payload: GeneratePrdRequest) -> Dict[str, Any]:
         return run_requirements_agent(payload.model_dump())
 
     return await to_thread.run_sync(_run)
-

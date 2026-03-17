@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     GROQ_REQUIREMENTS_API_KEY: str = Field(..., env="GROQ_REQUIREMENTS_API_KEY")
     GROQ_PLANNING_API_KEY: str = Field(..., env="GROQ_PLANNING_API_KEY")
+    PLANNING_AGENT_KEY: str | None = Field(default=None, env="PLANNING_AGENT_KEY")
+    MONITORING_AGENT_KEY: str | None = Field(default=None, env="MONITORING_AGENT_KEY")
+    RISK_AGENT_KEY: str | None = Field(default=None, env="RISK_AGENT_KEY")
+    REPLANNING_AGENT_KEY: str | None = Field(default=None, env="REPLANNING_AGENT_KEY")
 
     # GitHub integration
     GITHUB_CLIENT_ID: str | None = Field(default=None, env="GITHUB_CLIENT_ID")
@@ -48,4 +52,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

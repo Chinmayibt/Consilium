@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,7 +6,7 @@
 
 @layer base {
   :root {
-    --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --font-sans: 'Manrope', ui-sans-serif, system-ui, -apple-system, sans-serif;
 
     /* Consilium Light palette - Modern SaaS */
     --background: 210 40% 98%; /* #F8FAFC */
@@ -94,6 +94,10 @@
   }
   body {
     @apply bg-background text-foreground font-sans antialiased text-[15px] leading-relaxed;
+    background-image:
+      radial-gradient(circle at top left, hsl(var(--secondary) / 0.12), transparent 22rem),
+      radial-gradient(circle at top right, hsl(var(--primary) / 0.12), transparent 24rem),
+      linear-gradient(180deg, hsl(var(--background)) 0%, hsl(210 45% 99%) 100%);
   }
   h1 {
     @apply text-2xl font-semibold tracking-tight text-foreground;
@@ -115,16 +119,19 @@
     @apply text-xs text-muted-foreground leading-normal;
   }
   .page-container {
-    @apply p-6 lg:p-8 max-w-6xl mx-auto space-y-8;
+    @apply p-6 lg:p-8 max-w-7xl mx-auto space-y-8;
   }
   .section-grid {
     @apply grid gap-6 md:grid-cols-2 lg:grid-cols-3;
   }
   .card-base {
-    @apply rounded-xl border border-border/80 bg-card p-6 shadow-sm transition-shadow duration-200 hover:shadow-md;
+    @apply rounded-2xl border border-border/70 bg-card/90 p-6 shadow-[0_18px_45px_-28px_rgba(15,23,42,0.32)] backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[0_24px_50px_-28px_rgba(15,23,42,0.4)];
   }
   .animate-fade-in {
     animation: fadeIn 0.35s ease-out;
+  }
+  .hero-panel {
+    @apply rounded-[28px] border border-white/60 bg-white/85 shadow-[0_28px_70px_-34px_rgba(79,70,229,0.35)] backdrop-blur-xl;
   }
 }
 

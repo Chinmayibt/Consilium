@@ -231,11 +231,14 @@ export async function updateWorkspaceTaskStatus(
 
 export interface WorkspaceNotification {
   id?: string;
+  user_id?: string | null;
   type?: string;
   message?: string;
   severity?: string;
   read?: boolean;
   created_at?: string;
+  workspace_id?: string;
+  workspace_name?: string;
 }
 
 export async function fetchWorkspaceNotifications(
@@ -254,6 +257,24 @@ export async function markWorkspaceNotificationsRead(
   await api.patch(`/api/workspaces/${workspaceId}/notifications/read`, {
     notification_ids: notificationIds ?? null,
   });
+}
+
+export async function fetchNotifications(): Promise<{
+  notifications: WorkspaceNotification[];
+  unread_count: number;
+}> {
+  const { data } = await api.get<{
+    notifications: WorkspaceNotification[];
+    unread_count: number;
+  }>("/api/notifications");
+  return {
+    notifications: data.notifications ?? [],
+    unread_count: data.unread_count ?? 0,
+  };
+}
+
+export async function markNotificationsRead(): Promise<void> {
+  await api.post("/api/notifications/read");
 }
 
 export interface ActivityLogEntry {
@@ -319,4 +340,3 @@ export async function fetchProjectInsight(
   );
   return data;
 }
-
