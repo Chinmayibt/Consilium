@@ -16,4 +16,5 @@ class ProjectState(TypedDict, total=False):
     blockers: List[Dict[str, Any]]
     risks: List[Dict[str, Any]]
     notifications: List[Dict[str, Any]]
+    activity_log: List[Dict[str, Any]]
     project_complete: bool

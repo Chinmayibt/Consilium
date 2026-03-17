@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from github import Github
 
@@ -121,4 +121,183 @@ def build_activity_events(
 
     events.sort(key=_key, reverse=True)
     return events
+
+
+def _event_id_pr(pr_num: Any, merged: bool) -> str:
+    return f"github:pr:{pr_num}:{'merged' if merged else 'closed'}"
+
+
+def _event_id_commit(sha: str) -> str:
+    return f"github:commit:{sha}"
+
+
+def apply_github_activity_to_tasks(
+    tasks: List[Dict[str, Any]],
+    commits: List[Dict[str, Any]],
+    pull_requests: List[Dict[str, Any]],
+    processed_event_ids: Set[str] | None = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """
+    Update task status based on GitHub activity. Process each event at most once (by event_id).
+    Returns (updated_tasks, activity_entries_to_append, processed_event_ids_used).
+    """
+    from datetime import datetime, timezone
+
+    processed = processed_event_ids or set()
+    newly_processed: List[str] = []
+    tasks = [dict(t) for t in tasks]
+    activity: List[Dict[str, Any]] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    task_by_pr: Dict[int, int] = {}
+    for i, t in enumerate(tasks):
+        pr_num = t.get("github_pr")
+        if pr_num is not None:
+            try:
+                task_by_pr[int(pr_num)] = i
+            except (TypeError, ValueError):
+                pass
+
+    for pr in pull_requests:
+        pr_num = pr.get("number")
+        if pr_num not in task_by_pr:
+            continue
+        merged = pr.get("merged")
+        state_str = (pr.get("state") or "").lower()
+        eid = _event_id_pr(pr_num, merged)
+        if eid in processed:
+            continue
+        idx = task_by_pr[pr_num]
+        t = tasks[idx]
+        if merged:
+            if (t.get("status") or "").lower() != "done":
+                tasks[idx]["status"] = "done"
+                activity.append({
+                    "action_type": "COMMIT_DETECTED",
+                    "description": f"PR #{pr_num} merged → task marked done: {t.get('title', '')}",
+                    "user_id": "",
+                    "entity_id": str(t.get("id") or ""),
+                    "timestamp": now,
+                })
+                newly_processed.append(eid)
+        elif state_str == "closed":
+            if (t.get("status") or "").lower() != "blocked":
+                tasks[idx]["status"] = "blocked"
+                activity.append({
+                    "action_type": "BLOCKER_DETECTED",
+                    "description": f"PR #{pr_num} closed unmerged → task blocked: {t.get('title', '')}",
+                    "user_id": "",
+                    "entity_id": str(t.get("id") or ""),
+                    "timestamp": now,
+                })
+                newly_processed.append(eid)
+
+    for c in commits:
+        sha = (c.get("sha") or "")[:12]
+        if not sha:
+            continue
+        eid = _event_id_commit(sha)
+        if eid in processed:
+            continue
+        msg = (c.get("message") or "").lower()
+        if not msg:
+            continue
+        for i, t in enumerate(tasks):
+            if (t.get("status") or "").lower() in ("done", "blocked"):
+                continue
+            task_id = str(t.get("id") or "")
+            title = (t.get("title") or "").lower()
+            if task_id and task_id in msg:
+                tasks[i]["status"] = "in_progress"
+                activity.append({
+                    "action_type": "COMMIT_DETECTED",
+                    "description": f"Commit references task {task_id} → in progress: {t.get('title', '')}",
+                    "user_id": c.get("user") or "",
+                    "entity_id": task_id,
+                    "timestamp": now,
+                })
+                newly_processed.append(eid)
+                break
+            if len(title) > 10 and title[:20] in msg:
+                tasks[i]["status"] = "in_progress"
+                activity.append({
+                    "action_type": "COMMIT_DETECTED",
+                    "description": f"Commit references task → in progress: {t.get('title', '')}",
+                    "user_id": c.get("user") or "",
+                    "entity_id": str(t.get("id") or ""),
+                    "timestamp": now,
+                })
+                newly_processed.append(eid)
+                break
+
+    return tasks, activity, newly_processed
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    try:
+        if "Z" in ts or ts.endswith("+00:00"):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def dedupe_activity_append(
+    existing_log: List[Dict[str, Any]],
+    new_entries: List[Dict[str, Any]],
+    window_seconds: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Append new_entries to existing_log, skipping duplicates.
+    Duplicate = same action_type + entity_id + description prefix already present within window_seconds.
+    """
+    now = datetime.now(timezone.utc)
+    recent_keys: set = set()
+    for e in reversed(existing_log[-100:]):
+        ts = e.get("timestamp")
+        if not ts:
+            continue
+        t = _parse_iso(ts)
+        if t is None:
+            continue
+        if (now - t).total_seconds() > window_seconds:
+            break
+        key = (e.get("action_type") or "", e.get("entity_id") or "", (e.get("description") or "")[:80])
+        recent_keys.add(key)
+    out = list(existing_log)
+    for e in new_entries:
+        key = (e.get("action_type") or "", e.get("entity_id") or "", (e.get("description") or "")[:80])
+        if key in recent_keys:
+            continue
+        recent_keys.add(key)
+        out.append(e)
+    return out
+
+
+def dedupe_activity_list(
+    entries: List[Dict[str, Any]],
+    window_seconds: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Remove duplicate activity entries. Keep first occurrence; drop later duplicates
+    with same (action_type, entity_id, description prefix) within window_seconds.
+    """
+    result: List[Dict[str, Any]] = []
+    for e in entries:
+        key = (e.get("action_type") or "", e.get("entity_id") or "", (e.get("description") or "")[:80])
+        ts = e.get("timestamp")
+        t = _parse_iso(ts) if ts else None
+        is_dup = False
+        for r in result[-50:]:
+            rts = r.get("timestamp")
+            rt = _parse_iso(rts) if rts else None
+            if rt is None or t is None:
+                continue
+            rkey = (r.get("action_type") or "", r.get("entity_id") or "", (r.get("description") or "")[:80])
+            if rkey == key and abs((t - rt).total_seconds()) <= window_seconds:
+                is_dup = True
+                break
+        if not is_dup:
+            result.append(e)
+    return result
 

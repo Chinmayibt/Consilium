@@ -8,11 +8,12 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { useAuthStore } from "@/store/authStore";
 import { useWorkspaceStore } from "@/store/workspaceStore";
 import { Clock } from "@/components/Clock";
+import { ProjectInsightBot } from "@/components/ProjectInsightBot";
 
 export function DashboardLayout() {
   const user = useAuthStore((s) => s.user);
   const initials =
-    user?.avatar_initials ?? user?.name?.slice(0, 2).toUpperCase() ?? "PA";
+    user?.avatar_initials ?? user?.name?.slice(0, 2).toUpperCase() ?? "CN";
   const { workspaceId } = useParams<{ workspaceId: string }>();
   const workspaces = useWorkspaceStore((s) => s.workspaces);
   const activeWorkspace = useWorkspaceStore((s) => s.activeWorkspace);
@@ -67,6 +68,7 @@ export function DashboardLayout() {
           <main className="flex-1 overflow-auto">
             <Outlet />
           </main>
+          <ProjectInsightBot />
         </div>
       </div>
     </SidebarProvider>

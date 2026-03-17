@@ -208,19 +208,47 @@ Constraints:
             )
         tasks = synthesized_tasks
 
-    # Ensure each task has id and optional deadline; round-robin assignment
+    # Ensure each task has id, phase, priority, deadline, dependencies; assign by role when possible
     import uuid
     assigned_tasks: List[Dict[str, Any]] = []
     m_count = len(members) or 1
+    phase_names = [p.get("phase") or p.get("title") or f"Phase {i+1}" for i, p in enumerate(phases)]
+    task_ids: List[str] = []
+
+    def _pick_assignee(task: Dict[str, Any], idx: int) -> Dict[str, Any] | None:
+        if not members:
+            return None
+        title = (task.get("title") or "").lower()
+        # Prefer role/skill match: backend -> backend, frontend/UI -> frontend, test -> qa
+        for m in members:
+            skills = (m.get("skills") or []) if isinstance(m.get("skills"), list) else []
+            role = (m.get("role") or "").lower()
+            if "backend" in title or "api" in title or "server" in title:
+                if any(s for s in skills if "backend" in str(s).lower() or "api" in str(s).lower()) or role == "manager":
+                    return m
+            if "frontend" in title or "ui" in title or "login" in title or "component" in title:
+                if any(s for s in skills if "frontend" in str(s).lower() or "ui" in str(s).lower() or "react" in str(s).lower()) or role == "manager":
+                    return m
+            if "test" in title or "qa" in title:
+                if any(s for s in skills if "test" in str(s).lower() or "qa" in str(s).lower()) or role == "manager":
+                    return m
+        return members[idx % m_count]
+
     for idx, task in enumerate(tasks):
         t = dict(task)
-        t.setdefault("id", str(uuid.uuid4())[:8])
+        tid = str(t.get("id") or uuid.uuid4().hex[:8])
+        t["id"] = tid
+        task_ids.append(tid)
         t.setdefault("deadline", None)
         t.setdefault("status", "todo")
-        if members:
-            member = members[idx % m_count]
+        t.setdefault("priority", "medium")
+        t.setdefault("dependencies", [])
+        t["phase"] = phase_names[idx % len(phase_names)] if phase_names else "Phase 1"
+        member = _pick_assignee(t, idx)
+        if member:
             t["assigned_to"] = str(member.get("user_id"))
             t["assigned_to_name"] = member.get("name")
+            t["assigned_user_id"] = str(member.get("user_id"))
         assigned_tasks.append(t)
     tasks = assigned_tasks
 

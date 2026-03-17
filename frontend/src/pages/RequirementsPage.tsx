@@ -133,7 +133,7 @@ export default function RequirementsPage() {
             <Input
               value={productName}
               onChange={(e) => setProductName(e.target.value)}
-              placeholder="ProjectAI"
+              placeholder="Consilium"
               className="h-9"
             />
           </div>

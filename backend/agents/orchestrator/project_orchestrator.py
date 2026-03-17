@@ -4,6 +4,7 @@ Reuses existing planning_agent; does not rewrite requirements_agent or planning_
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from langgraph.graph import END, StateGraph
@@ -11,17 +12,36 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .project_state import ProjectState
 from .monitoring_agent import run_monitoring
+from ..monitoring_agent import dedupe_activity_list
 from .risk_agent import run_risk_analysis
 from .replanning_agent import run_replanning
 from .notification_agent import run_notification
 from ..planning_agent import run_planning_agent
 
 
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _append_activity(state: ProjectState, action_type: str, description: str, entity_id: str = "", user_id: str = "") -> List[Dict[str, Any]]:
+    log = list(state.get("activity_log") or [])
+    log.append({
+        "action_type": action_type,
+        "description": description,
+        "user_id": user_id or "",
+        "entity_id": entity_id or "",
+        "timestamp": _utc_iso(),
+    })
+    return log
+
+
 def _build_kanban(tasks: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Group tasks by status into kanban columns."""
+    """Group tasks by status: backlog, todo, in_progress, review, blocked, done."""
     columns: Dict[str, List[Dict[str, Any]]] = {
+        "backlog": [],
         "todo": [],
         "in_progress": [],
+        "review": [],
         "blocked": [],
         "done": [],
     }
@@ -49,10 +69,30 @@ def planning_node(state: ProjectState) -> Dict[str, Any]:
             roadmap = roadmap.get("roadmap") or roadmap
         tasks = plan.get("tasks") or []
         kanban = _build_kanban(tasks)
+        activity_log = _append_activity(state, "PLAN_GENERATED", "Roadmap and tasks generated from PRD", entity_id=workspace_id)
+        for t in tasks:
+            task_id = str(t.get("id") or t.get("title", ""))
+            activity_log = list(activity_log)
+            activity_log.append({
+                "action_type": "TASK_CREATED",
+                "description": f"Task created: {t.get('title', '')}",
+                "user_id": "",
+                "entity_id": task_id,
+                "timestamp": _utc_iso(),
+            })
+            if t.get("assigned_to") or t.get("assigned_to_name"):
+                activity_log.append({
+                    "action_type": "TASK_ASSIGNED",
+                    "description": f"Task assigned to {t.get('assigned_to_name', '')}",
+                    "user_id": str(t.get("assigned_to") or ""),
+                    "entity_id": task_id,
+                    "timestamp": _utc_iso(),
+                })
         return {
             "roadmap": roadmap,
             "tasks": tasks,
             "kanban": kanban,
+            "activity_log": activity_log,
         }
     if tasks and not state.get("kanban"):
         return {"kanban": _build_kanban(tasks)}
@@ -66,24 +106,64 @@ def monitoring_node(state: ProjectState) -> Dict[str, Any]:
 
 def risk_node(state: ProjectState) -> Dict[str, Any]:
     """Analyze blockers and risks; suggest mitigation."""
-    return run_risk_analysis(state)
+    out = run_risk_analysis(state)
+    log = list(state.get("activity_log") or [])
+    if out.get("risks"):
+        log.append({
+            "action_type": "RISK_UPDATED",
+            "description": "Risks analyzed and mitigation suggested",
+            "user_id": "",
+            "entity_id": state.get("workspace_id", ""),
+            "timestamp": _utc_iso(),
+        })
+        out["activity_log"] = log
+    return out
 
 
 def replanning_node(state: ProjectState) -> Dict[str, Any]:
     """Reassign blocked tasks and adjust deadlines."""
-    return run_replanning(state)
+    out = run_replanning(state)
+    log = list(state.get("activity_log") or [])
+    log.append({
+        "action_type": "REPLANNING_TRIGGERED",
+        "description": "Schedule and assignments updated due to risks or blockers",
+        "user_id": "",
+        "entity_id": state.get("workspace_id", ""),
+        "timestamp": _utc_iso(),
+    })
+    out["activity_log"] = log
+    notifications = list(out.get("notifications") or state.get("notifications") or [])
+    notifications.append({
+        "type": "replanning",
+        "message": "Schedule updated. Review task assignments and deadlines.",
+        "read": False,
+        "created_at": _utc_iso(),
+    })
+    out["notifications"] = notifications
+    return out
 
 
 def notification_node(state: ProjectState) -> Dict[str, Any]:
-    """Emit in-app notifications."""
-    return run_notification(state)
+    """Emit in-app notifications; log project completion to activity."""
+    out = run_notification(state)
+    if state.get("project_complete"):
+        log = list(state.get("activity_log") or [])
+        log.append({
+            "action_type": "PROJECT_COMPLETED",
+            "description": "All tasks completed. Project finished successfully.",
+            "user_id": "",
+            "entity_id": state.get("workspace_id", ""),
+            "timestamp": _utc_iso(),
+        })
+        out["activity_log"] = log
+    return out
 
 
 def _route_after_monitoring(state: ProjectState) -> str:
-    """Route: if blocker -> risk; if project_complete -> end; else end (next tick can run again)."""
+    """Route: if blocker or risks -> risk/replan; if project_complete -> notification then end."""
     if state.get("project_complete"):
         return "notification_then_end"
-    if state.get("blockers"):
+    if state.get("blockers") or (state.get("risks") and (state.get("tasks") or [])):
         return "risk"
     return "end"
 
@@ -139,6 +219,7 @@ def run_project_tick(workspace_id: str, workspace_doc: Dict[str, Any]) -> Dict[s
     members = workspace_doc.get("members") or []
     github = workspace_doc.get("github") or {}
     notifications = workspace_doc.get("notifications") or []
+    activity_log = workspace_doc.get("activity_log") or []
 
     initial: ProjectState = {
         "workspace_id": workspace_id,
@@ -147,6 +228,7 @@ def run_project_tick(workspace_id: str, workspace_doc: Dict[str, Any]) -> Dict[s
         "tasks": tasks,
         "team_members": members,
         "kanban": workspace_doc.get("kanban") or _build_kanban(tasks),
+        "activity_log": activity_log,
         "github_repo": {
             "repo_owner": github.get("repo_owner"),
             "repo_name": github.get("repo_name"),
@@ -154,8 +236,8 @@ def run_project_tick(workspace_id: str, workspace_doc: Dict[str, Any]) -> Dict[s
             "access_token": github.get("access_token"),
         } if github else {},
         "commits": [],
-        "blockers": [],
-        "risks": [],
+        "blockers": workspace_doc.get("blockers") or [],
+        "risks": workspace_doc.get("risks") or [],
         "notifications": notifications,
         "project_complete": False,
     }
@@ -188,11 +270,15 @@ async def start_project_graph(workspace_id: str) -> None:
 
     final = run_project_tick(workspace_id, workspace)
 
+    activity_log = final.get("activity_log")
+    if activity_log:
+        activity_log = dedupe_activity_list(activity_log, window_seconds=60)
     updates: Dict[str, Any] = {
         "roadmap": final.get("roadmap"),
         "tasks": final.get("tasks"),
         "kanban": final.get("kanban"),
         "notifications": final.get("notifications"),
+        "activity_log": activity_log,
     }
     if final.get("blockers") is not None:
         updates["blockers"] = final["blockers"]

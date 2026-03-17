@@ -5,6 +5,7 @@ from typing import List
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
+
 from pydantic import BaseModel
 from pymongo.collection import Collection
 
@@ -18,6 +19,28 @@ router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 def get_workspaces_collection() -> Collection:
     db = get_db()
     return db["workspaces"]
+
+
+async def _enrich_workspace_members(members_raw: list, created_at=None) -> List[WorkspaceMember]:
+    """Fill in name/email/role from users collection when missing on member."""
+    db = get_db()
+    users_coll = db["users"]
+    enriched = []
+    for m in members_raw:
+        m = dict(m)
+        if not m.get("name") or not m.get("email"):
+            try:
+                user_doc = await users_coll.find_one({"_id": ObjectId(m["user_id"])})
+                if user_doc:
+                    m["name"] = m.get("name") or user_doc.get("name")
+                    m["email"] = m.get("email") or user_doc.get("email")
+                    m["role"] = m.get("role") or user_doc.get("role", "member")
+            except Exception:
+                pass
+        if not m.get("joined_at"):
+            m["joined_at"] = created_at or datetime.utcnow()
+        enriched.append(WorkspaceMember(**m))
+    return enriched
 
 
 def generate_invite_code() -> str:
@@ -44,6 +67,7 @@ async def create_workspace(
         name=current_user.get("name"),
         email=current_user.get("email"),
         role="manager",
+        skills=current_user.get("skills") or [],
     )
 
     doc = {
@@ -98,9 +122,10 @@ async def list_workspaces(current_user=Depends(get_current_user)):
 
     results: List[WorkspacePublic] = []
     async for w in cursor:
-        members = [
-            WorkspaceMember(**m) for m in w.get("members", [])
-        ]
+        members_enriched = await _enrich_workspace_members(
+            w.get("members") or [],
+            created_at=w.get("created_at"),
+        )
         results.append(
             WorkspacePublic(
                 id=str(w["_id"]),
@@ -111,7 +136,7 @@ async def list_workspaces(current_user=Depends(get_current_user)):
                 team_size=w.get("team_size"),
                 deadline=w.get("deadline"),
                 owner_id=w["owner_id"],
-                members=members,
+                members=members_enriched,
                 created_at=w["created_at"],
                 status=w.get("status", "active"),
             )
@@ -143,10 +168,22 @@ async def join_workspace(
             name=current_user.get("name"),
             email=current_user.get("email"),
             role=current_user["role"],
+            skills=current_user.get("skills") or [],
         )
+        from datetime import datetime, timezone
+        activity_entry = {
+            "action_type": "TEAM_MEMBER_ADDED",
+            "description": f"Team member joined: {current_user.get('name') or current_user.get('email') or 'User'}",
+            "user_id": user_id,
+            "entity_id": user_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
         await workspaces.update_one(
             {"_id": w["_id"]},
-            {"$addToSet": {"members": member.model_dump()}},
+            {
+                "$addToSet": {"members": member.model_dump()},
+                "$push": {"activity_log": {"$each": [activity_entry], "$position": 0}},
+            },
         )
 
         db = get_db()
@@ -157,7 +194,10 @@ async def join_workspace(
         # refresh workspace doc
         w = await workspaces.find_one({"_id": w["_id"]})
 
-    members = [WorkspaceMember(**m) for m in w.get("members", [])]
+    members = await _enrich_workspace_members(
+        w.get("members", []),
+        created_at=w.get("created_at"),
+    )
     return WorkspacePublic(
         id=str(w["_id"]),
         name=w["name"],

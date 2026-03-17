@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Users, Building2, Trash2 } from "lucide-react";
+import { Plus, Users, Building2, Trash2, Folder } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -65,50 +65,54 @@ function WorkspaceCard({ workspace }: { workspace: Workspace }) {
     <button
       type="button"
       onClick={handleOpen}
-      className="group flex flex-col items-start gap-3 rounded-xl border bg-card p-4 text-left shadow-sm transition-all hover:border-primary/40 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className="group relative flex flex-col justify-between w-full min-h-[160px] rounded-2xl border border-border/60 bg-card p-6 text-left shadow-[0_4px_20px_-4px_rgba(0,0,0,0.03)] transition-all duration-300 hover:scale-[1.02] hover:border-primary/40 hover:shadow-[0_12px_40px_-8px_rgba(0,0,0,0.12)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
     >
-      <div className="flex w-full items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary text-sm font-semibold">
-            {workspace.name.slice(0, 2).toUpperCase()}
-          </span>
-          <div>
-            <h3 className="text-sm font-semibold text-foreground line-clamp-1">
+      <div className="flex w-full gap-5 h-full">
+        {/* Left Section: Folder Icon */}
+        <div className="flex h-[60px] w-[60px] items-center justify-center rounded-2xl bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400 shrink-0 group-hover:bg-indigo-500/20 group-hover:scale-105 transition-all mt-1">
+          <Folder className="h-8 w-8" />
+        </div>
+
+        {/* Right Section: Content */}
+        <div className="flex flex-col flex-1 h-full min-w-0">
+          <div className="flex items-start justify-between gap-3 mb-2">
+            <h3 className="text-[20px] font-bold text-foreground line-clamp-1 tracking-tight pr-2">
               {workspace.name}
             </h3>
-            {workspace.description && (
-              <p className="text-xs text-muted-foreground line-clamp-1">
-                {workspace.description}
-              </p>
-            )}
+            
+            <div className="flex items-center gap-2 shrink-0">
+              <Badge
+                variant={workspace.status === "completed" ? "outline" : "secondary"}
+                className="text-[10px] uppercase tracking-wider font-semibold shadow-sm px-2 py-0.5"
+              >
+                {workspace.status === "completed" ? "Completed" : "Active"}
+              </Badge>
+              {isOwner && (
+                <div
+                  onClick={handleDelete}
+                  className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-destructive/20 bg-destructive/5 text-destructive hover:bg-destructive/10 hover:border-destructive/40 transition-colors z-10"
+                  title="Delete Workspace"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </div>
+              )}
+            </div>
+          </div>
+          
+          <p className="text-[14px] text-muted-foreground line-clamp-2 leading-relaxed flex-1 w-full max-w-[90%]">
+            {workspace.description || "No description provided."}
+          </p>
+
+          <div className="flex items-center justify-between w-full text-[13px] font-medium text-muted-foreground mt-4 pt-3 border-t border-border/40">
+            <div className="flex items-center gap-2">
+              <Users className="h-3.5 w-3.5" />
+              <span>{memberCount} member{memberCount !== 1 && 's'}</span>
+            </div>
+            <div className="flex items-center gap-2 text-foreground/70">
+              <span className="truncate max-w-[140px] tracking-tight">{workspace.created_at ? new Date(workspace.created_at).toLocaleDateString() : "Just now"}</span>
+            </div>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <Badge
-            variant={workspace.status === "completed" ? "outline" : "secondary"}
-            className="text-[11px] uppercase tracking-wide"
-          >
-            {workspace.status === "completed" ? "Completed" : "Active"}
-          </Badge>
-          {isOwner && (
-            <button
-              type="button"
-              onClick={handleDelete}
-              className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-destructive/40 text-destructive hover:bg-destructive/10 transition"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
-          )}
-        </div>
-      </div>
-      <div className="flex items-center justify-between w-full text-xs text-muted-foreground">
-        <div className="inline-flex items-center gap-1.5">
-          <Users className="h-3.5 w-3.5" />
-          <span>{memberCount} members</span>
-        </div>
-        {workspace.tech_stack && (
-          <span className="truncate max-w-[140px]">{workspace.tech_stack}</span>
-        )}
       </div>
     </button>
   );
@@ -200,17 +204,17 @@ export default function WorkspacesPage() {
   };
 
   return (
-    <div className="page-container animate-fade-in">
-      <div className="flex items-start justify-between gap-4 mb-6">
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+    <div className="page-container max-w-[1400px] mx-auto animate-fade-in py-8 px-4 sm:px-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-6 mb-10">
+        <div className="space-y-1.5">
+          <h1 className="text-3xl font-extrabold tracking-tight text-foreground">
             Your workspaces
           </h1>
-          <p className="text-sm text-muted-foreground">
-            Select a workspace to open its AI-powered project dashboard.
+          <p className="text-[15px] font-medium text-muted-foreground">
+            Select a project dashboard to start orchestrating work.
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-4">
           {isManager && (
             <Dialog open={createOpen} onOpenChange={setCreateOpen}>
               <DialogTrigger asChild>
@@ -323,7 +327,7 @@ export default function WorkspacesPage() {
       {isLoading ? (
         <p className="text-sm text-muted-foreground">Loading workspaces...</p>
       ) : data && data.length > 0 ? (
-        <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+        <div className="grid gap-6 sm:gap-8 grid-cols-1 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-2 pt-2">
           {data.map((ws) => (
             <WorkspaceCard key={ws.id} workspace={ws} />
           ))}

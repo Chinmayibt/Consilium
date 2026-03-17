@@ -18,7 +18,7 @@ export default function SettingsPage() {
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>Project Name</Label>
-              <Input defaultValue="ProjectAI Dashboard" />
+              <Input defaultValue="Consilium Dashboard" />
             </div>
             <div className="space-y-2">
               <Label>Repository URL</Label>

@@ -125,6 +125,12 @@ If there are no meaningful risks, return {{"risks": []}}.
             }
         ]
 
+    def _risk_key(r: Dict[str, Any]) -> str:
+        """Stable key for deduplication: normalized title + first 60 chars of description."""
+        title = (r.get("title") or "").strip().lower()[:80]
+        desc = (r.get("description") or r.get("impact") or "")[:60]
+        return f"{title}|{desc}"
+
     now_iso = _utc_now_iso()
     enriched = []
     for r in new_risks:
@@ -142,7 +148,10 @@ If there are no meaningful risks, return {{"risks": []}}.
             }
         )
 
-    # Append to existing risks
-    existing_risks.extend(enriched)
-    return existing_risks
+    # Merge: update existing by key, append new
+    by_key: Dict[str, Dict[str, Any]] = {_risk_key(r): r for r in existing_risks}
+    for r in enriched:
+        k = _risk_key(r)
+        by_key[k] = r  # update in place so severity/mitigation etc. refresh
+    return list(by_key.values())
 

@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Dict, List
 from io import BytesIO
 
@@ -133,11 +134,17 @@ async def save_workspace_prd(
     return None
 
 
+# Kanban columns per spec: Backlog, Todo, In Progress, Review, Blocked, Done
+KANBAN_STATUSES = ("backlog", "todo", "in_progress", "review", "blocked", "done")
+
+
 def _build_kanban(tasks: list) -> Dict[str, Any]:
     """Group tasks by status for kanban columns."""
     columns: Dict[str, list] = {
+        "backlog": [],
         "todo": [],
         "in_progress": [],
+        "review": [],
         "blocked": [],
         "done": [],
     }
@@ -379,6 +386,53 @@ class KanbanResponse(BaseModel):
     tasks: List[Dict[str, Any]]
 
 
+async def _enrich_members_from_users(members_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill name/email/role from users collection when missing on workspace members."""
+    db = get_db()
+    users_coll = db["users"]
+    result = []
+    for m in members_raw:
+        m = dict(m)
+        user_id = m.get("user_id")
+        if user_id and (not m.get("name") or not m.get("email")):
+            try:
+                user_doc = await users_coll.find_one({"_id": ObjectId(user_id)})
+                if user_doc:
+                    m["name"] = m.get("name") or user_doc.get("name")
+                    m["email"] = m.get("email") or user_doc.get("email")
+                    m["role"] = m.get("role") or user_doc.get("role", "member")
+            except Exception:
+                pass
+        result.append(m)
+    return result
+
+
+def _enrich_tasks_with_members(
+    tasks: List[Dict[str, Any]],
+    members: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Join tasks with workspace members; set assigned_user_id, assigned_name, role."""
+    member_by_id = {str(m.get("user_id")): m for m in members if m.get("user_id")}
+    enriched = []
+    for t in tasks:
+        task = dict(t)
+        assigned_id = str(task.get("assigned_to") or "")
+        if assigned_id and assigned_id in member_by_id:
+            member = member_by_id[assigned_id]
+            name = member.get("name") or task.get("assigned_to_name") or "Unassigned"
+            task["assigned_to_name"] = name
+            task["assigned_to_role"] = member.get("role")
+            task["assigned_user_id"] = assigned_id
+            task["assigned_name"] = name
+        else:
+            if not task.get("assigned_to_name"):
+                task["assigned_to_name"] = "Unassigned"
+            task["assigned_user_id"] = assigned_id or None
+            task["assigned_name"] = task.get("assigned_to_name") or "Unassigned"
+        enriched.append(task)
+    return enriched
+
+
 @router.get(
     "/{workspace_id}/kanban",
     response_model=KanbanResponse,
@@ -398,8 +452,66 @@ async def get_workspace_kanban(
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     tasks = workspace.get("tasks") or []
-    kanban = workspace.get("kanban") or _build_kanban(tasks)
+    members_raw = workspace.get("members") or []
+    members = await _enrich_members_from_users(members_raw)
+    tasks = _enrich_tasks_with_members(tasks, members)
+    kanban = _build_kanban(tasks)
     return KanbanResponse(kanban=kanban, tasks=tasks)
+
+
+class UpdateWorkspaceTaskRequest(BaseModel):
+    status: str | None = None
+    priority: str | None = None
+    deadline: str | None = None
+
+
+class TaskResponse(BaseModel):
+    task: Dict[str, Any]
+
+
+@router.patch(
+    "/{workspace_id}/tasks/{task_id}",
+    response_model=TaskResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def update_workspace_task(
+    workspace_id: str,
+    task_id: str,
+    payload: UpdateWorkspaceTaskRequest,
+    current_user=Depends(get_current_user),
+) -> TaskResponse:
+    """Update a workspace task (status, priority, deadline). Used for drag-and-drop Kanban."""
+    db = get_db()
+    workspaces = db["workspaces"]
+    try:
+        oid = ObjectId(workspace_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid workspace id")
+    workspace = await workspaces.find_one({"_id": oid})
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    tasks = list(workspace.get("tasks") or [])
+    task_index = next((i for i, t in enumerate(tasks) if str(t.get("id")) == str(task_id)), None)
+    if task_index is None:
+        task_index = next((i for i, t in enumerate(tasks) if (t.get("title") or "").strip() == (task_id or "").strip()), None)
+    if task_index is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if payload.status is not None:
+        status = payload.status.lower()
+        if status not in KANBAN_STATUSES and status != "blocked":
+            raise HTTPException(status_code=400, detail=f"Invalid status; use one of: {KANBAN_STATUSES}")
+        tasks[task_index]["status"] = status
+    if payload.priority is not None:
+        tasks[task_index]["priority"] = payload.priority
+    if payload.deadline is not None:
+        tasks[task_index]["deadline"] = payload.deadline
+    tasks[task_index]["updated_at"] = datetime.utcnow().isoformat()
+    await workspaces.update_one({"_id": oid}, {"$set": {"tasks": tasks}})
+    updated = dict(tasks[task_index])
+    members_raw = workspace.get("members") or []
+    members = await _enrich_members_from_users(members_raw)
+    enriched = _enrich_tasks_with_members([updated], members)
+    return TaskResponse(task=enriched[0] if enriched else updated)
 
 
 class NotificationsResponse(BaseModel):
@@ -426,6 +538,64 @@ async def get_workspace_notifications(
         raise HTTPException(status_code=404, detail="Workspace not found")
     notifications = workspace.get("notifications") or []
     return NotificationsResponse(notifications=notifications)
+
+
+class MarkNotificationsReadRequest(BaseModel):
+    notification_ids: List[str] | None = None  # if empty/omit, mark all as read
+
+
+@router.patch(
+    "/{workspace_id}/notifications/read",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def mark_notifications_read(
+    workspace_id: str,
+    payload: MarkNotificationsReadRequest,
+    current_user=Depends(get_current_user),
+) -> None:
+    db = get_db()
+    workspaces = db["workspaces"]
+    try:
+        oid = ObjectId(workspace_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid workspace id")
+    workspace = await workspaces.find_one({"_id": oid})
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    notifications = list(workspace.get("notifications") or [])
+    ids_to_mark = set(payload.notification_ids or [])
+    for i, n in enumerate(notifications):
+        if isinstance(n, dict):
+            nid = n.get("id") or str(i)
+            if not ids_to_mark or nid in ids_to_mark:
+                n["read"] = True
+    await workspaces.update_one({"_id": oid}, {"$set": {"notifications": notifications}})
+
+
+class ActivityResponse(BaseModel):
+    activity_log: List[Dict[str, Any]]
+
+
+@router.get(
+    "/{workspace_id}/activity",
+    response_model=ActivityResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def get_workspace_activity(
+    workspace_id: str,
+    current_user=Depends(get_current_user),
+) -> ActivityResponse:
+    db = get_db()
+    workspaces = db["workspaces"]
+    try:
+        oid = ObjectId(workspace_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid workspace id")
+    workspace = await workspaces.find_one({"_id": oid})
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    activity_log = workspace.get("activity_log") or []
+    return ActivityResponse(activity_log=sorted(activity_log, key=lambda x: x.get("timestamp", ""), reverse=True))
 
 
 class RisksResponse(BaseModel):

@@ -33,6 +33,8 @@ class Settings(BaseSettings):
         env="FRONTEND_URL",
     )
 
+    GEMINI_API_KEY: str | None = Field(default=None, env="GEMINI_API_KEY")
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         env_file_encoding="utf-8",

@@ -5,11 +5,12 @@ from pydantic import BaseModel, Field
 
 
 class WorkspaceMember(BaseModel):
-  user_id: str
-  name: str | None = None
-  email: str | None = None
-  role: Literal["manager", "member"]
-  joined_at: datetime = Field(default_factory=datetime.utcnow)
+    user_id: str
+    name: str | None = None
+    email: str | None = None
+    role: Literal["manager", "member"]
+    skills: List[str] = []
+    joined_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 class WorkspaceBase(BaseModel):

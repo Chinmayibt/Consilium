@@ -88,7 +88,12 @@ def run_monitoring(state: Dict[str, Any]) -> Dict[str, Any]:
                     changed = True
                 elif state_str == "closed":
                     tasks[idx]["status"] = "blocked"
-                    blockers.append({"task_id": task.get("id"), "reason": f"PR #{pr_num} closed without merge"})
+                    blockers.append({
+                        "task_id": task.get("id"),
+                        "task_title": task.get("title"),
+                        "reason": f"PR #{pr_num} closed without merge",
+                        "severity": "high",
+                    })
                     changed = True
 
             # Commit message mentioning task title -> in_progress

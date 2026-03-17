@@ -73,7 +73,7 @@ export default function SignupPage() {
             Create your account
           </h1>
           <p className="text-sm text-muted-foreground">
-            Get started with ProjectAI
+            Get started with Consilium
           </p>
         </div>
 
@@ -108,11 +108,12 @@ export default function SignupPage() {
           </button>
         </div>
 
-        <form className="space-y-4" onSubmit={handleSubmit(onSubmit)} noValidate>
-          <div className="grid grid-cols-2 gap-4">
+        <form className="space-y-5" onSubmit={handleSubmit(onSubmit)} noValidate>
+          {/* Row 1: First and Last Name */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <div className="space-y-2">
-              <Label className="text-[13px] font-medium">First name</Label>
-              <Input placeholder="Jane" className="h-11" {...register("firstName")} />
+              <Label className="text-sm font-medium">First name</Label>
+              <Input placeholder="Jane" className="h-11 bg-background" {...register("firstName")} />
               {errors.firstName && (
                 <p className="text-xs text-destructive mt-1">
                   {errors.firstName.message}
@@ -120,8 +121,8 @@ export default function SignupPage() {
               )}
             </div>
             <div className="space-y-2">
-              <Label className="text-[13px] font-medium">Last name</Label>
-              <Input placeholder="Doe" className="h-11" {...register("lastName")} />
+              <Label className="text-sm font-medium">Last name</Label>
+              <Input placeholder="Doe" className="h-11 bg-background" {...register("lastName")} />
               {errors.lastName && (
                 <p className="text-xs text-destructive mt-1">
                   {errors.lastName.message}
@@ -129,12 +130,14 @@ export default function SignupPage() {
               )}
             </div>
           </div>
+
+          {/* Row 2: Email */}
           <div className="space-y-2">
-            <Label className="text-[13px] font-medium">Email</Label>
+            <Label className="text-sm font-medium">Email</Label>
             <Input
               type="email"
               placeholder="you@company.com"
-              className="h-11"
+              className="h-11 bg-background"
               {...register("email")}
             />
             {errors.email && (
@@ -143,12 +146,17 @@ export default function SignupPage() {
               </p>
             )}
           </div>
+
+          {/* Row 3: Password */}
           <div className="space-y-2">
-            <Label className="text-[13px] font-medium">Password</Label>
+            <div className="flex justify-between items-center">
+              <Label className="text-sm font-medium">Password</Label>
+              <span className="text-xs text-muted-foreground">Min 6 characters</span>
+            </div>
             <Input
               type="password"
               placeholder="••••••••"
-              className="h-11"
+              className="h-11 bg-background"
               {...register("password")}
             />
             {errors.password && (
@@ -157,47 +165,26 @@ export default function SignupPage() {
               </p>
             )}
           </div>
+
+          {/* Row 4: Role / Designation */}
           <div className="space-y-2">
-            <Label className="text-[13px] font-medium">Role / Designation</Label>
+            <Label className="text-sm font-medium">Role / Designation</Label>
             <Input
-              placeholder="Frontend Engineer"
-              className="h-11"
+              placeholder="e.g. Frontend Engineer, Product Manager"
+              className="h-11 bg-background"
               {...register("roleDesignation")}
             />
           </div>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label className="text-[13px] font-medium">GitHub</Label>
-              <Input
-                placeholder="https://github.com/user"
-                className="h-11"
-                {...register("github")}
-              />
-              {errors.github && (
-                <p className="text-xs text-destructive mt-1">
-                  {errors.github.message}
-                </p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label className="text-[13px] font-medium">LinkedIn</Label>
-              <Input placeholder="linkedin.com/in/user" className="h-11" />
-            </div>
-          </div>
+
+          {/* Row 5: Skills */}
           <div className="space-y-2">
-            <Label className="text-[13px] font-medium">Skills</Label>
+            <Label className="text-sm font-medium">Skills</Label>
             <Textarea
-              placeholder="React, TypeScript, Node.js..."
+              placeholder="e.g. React, UX Design, Python (comma separated)"
               rows={2}
-              className="resize-none rounded-lg"
+              className="resize-none rounded-xl bg-background text-sm leading-relaxed"
               {...register("skills")}
             />
-          </div>
-          <div className="space-y-2">
-            <Label className="text-[13px] font-medium">
-              Tech Stack <span className="text-muted-foreground font-normal">(optional)</span>
-            </Label>
-            <Input placeholder="React, PostgreSQL, Docker" className="h-11" />
           </div>
           <Button className="w-full h-11" size="lg">
             {isSubmitting ? "Creating account..." : "Create account"}

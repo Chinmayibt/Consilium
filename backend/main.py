@@ -8,6 +8,7 @@ from .routers import projects as projects_router
 from .routers import tasks as tasks_router
 from .routers import requirements as requirements_router
 from .routers import github as github_router
+from .routers import ai_insights as ai_insights_router
 from .agents.monitoring_loop import monitoring_loop
 
 app = FastAPI(title="ProjectAI Backend")
@@ -40,6 +41,7 @@ app.include_router(projects_router.router)
 app.include_router(tasks_router.router)
 app.include_router(requirements_router.router)
 app.include_router(github_router.router)
+app.include_router(ai_insights_router.router)
 
 
 

@@ -7,6 +7,7 @@ export interface WorkspaceMember {
   name?: string | null;
   email?: string | null;
   role: "manager" | "member";
+  skills?: string[];
   joined_at: string;
 }
 
@@ -78,11 +79,20 @@ export interface RoadmapPhase {
 }
 
 export interface RoadmapTask {
+  id?: string;
   title: string;
   description?: string;
+  phase?: string;
   assigned_to?: string;
   assigned_to_name?: string;
+  assigned_to_role?: string;
+  assigned_user_id?: string;
+  assigned_name?: string;
   status?: string;
+  priority?: string;
+  deadline?: string;
+  dependencies?: string[];
+  [key: string]: unknown;
 }
 
 export interface Roadmap {
@@ -172,11 +182,22 @@ export async function fetchWorkspaceRoadmap(
 }
 
 export interface KanbanColumn {
+  backlog: RoadmapTask[];
   todo: RoadmapTask[];
   in_progress: RoadmapTask[];
+  review: RoadmapTask[];
   blocked: RoadmapTask[];
   done: RoadmapTask[];
 }
+
+const emptyKanban = (): KanbanColumn => ({
+  backlog: [],
+  todo: [],
+  in_progress: [],
+  review: [],
+  blocked: [],
+  done: [],
+});
 
 export async function fetchWorkspaceKanban(
   workspaceId: string,
@@ -184,13 +205,37 @@ export async function fetchWorkspaceKanban(
   const { data } = await api.get<{ kanban: KanbanColumn; tasks: RoadmapTask[] }>(
     `/api/workspaces/${workspaceId}/kanban`,
   );
-  return { kanban: data.kanban ?? { todo: [], in_progress: [], blocked: [], done: [] }, tasks: data.tasks ?? [] };
+  return {
+    kanban: data.kanban ?? emptyKanban(),
+    tasks: data.tasks ?? [],
+  };
+}
+
+export interface UpdateWorkspaceTaskPayload {
+  status?: string;
+  priority?: string;
+  deadline?: string;
+}
+
+export async function updateWorkspaceTaskStatus(
+  workspaceId: string,
+  taskId: string,
+  payload: UpdateWorkspaceTaskPayload,
+): Promise<{ task: RoadmapTask }> {
+  const { data } = await api.patch<{ task: RoadmapTask }>(
+    `/api/workspaces/${workspaceId}/tasks/${taskId}`,
+    payload,
+  );
+  return data;
 }
 
 export interface WorkspaceNotification {
+  id?: string;
   type?: string;
   message?: string;
   severity?: string;
+  read?: boolean;
+  created_at?: string;
 }
 
 export async function fetchWorkspaceNotifications(
@@ -200,6 +245,32 @@ export async function fetchWorkspaceNotifications(
     `/api/workspaces/${workspaceId}/notifications`,
   );
   return data.notifications ?? [];
+}
+
+export async function markWorkspaceNotificationsRead(
+  workspaceId: string,
+  notificationIds?: string[],
+): Promise<void> {
+  await api.patch(`/api/workspaces/${workspaceId}/notifications/read`, {
+    notification_ids: notificationIds ?? null,
+  });
+}
+
+export interface ActivityLogEntry {
+  action_type: string;
+  description: string;
+  user_id: string;
+  entity_id: string;
+  timestamp: string;
+}
+
+export async function fetchWorkspaceActivity(
+  workspaceId: string,
+): Promise<ActivityLogEntry[]> {
+  const { data } = await api.get<{ activity_log: ActivityLogEntry[] }>(
+    `/api/workspaces/${workspaceId}/activity`,
+  );
+  return data.activity_log ?? [];
 }
 
 export interface WorkspaceRisk {
@@ -221,5 +292,31 @@ export async function fetchWorkspaceRisks(
 
 export async function deleteWorkspace(workspaceId: string): Promise<void> {
   await api.delete(`/workspaces/${workspaceId}`);
+}
+
+export async function removeWorkspaceMember(
+  workspaceId: string,
+  memberId: string,
+): Promise<void> {
+  await api.delete(`/workspaces/${workspaceId}/members/${memberId}`);
+}
+
+export interface ProjectInsightsRequest {
+  workspaceId: string;
+  question: string;
+}
+
+export interface ProjectInsightsResponse {
+  answer: string;
+}
+
+export async function fetchProjectInsight(
+  payload: ProjectInsightsRequest,
+): Promise<ProjectInsightsResponse> {
+  const { data } = await api.post<ProjectInsightsResponse>(
+    "/api/ai/project-insights",
+    payload,
+  );
+  return data;
 }
 
