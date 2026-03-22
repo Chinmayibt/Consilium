@@ -1,23 +1,54 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from bson import ObjectId
 from langgraph.graph import END, StateGraph
 
 from ..database import get_db
-from .monitoring_agent import build_activity_events, dedupe_activity_list, fetch_github_activity, monitoring_node
-from .notification_agent import notification_node
+from .monitoring_agent import (
+    _stable_hash,
+    build_activity_events,
+    dedupe_activity_list,
+    decide_next_action,
+    execution_node,
+    fetch_github_activity,
+    monitoring_node,
+    update_historical_metrics,
+)
+from .notification_agent import communication_node
 from .planning_agent import run_planning_agent
 from .replanning_agent import replanning_node
 from .risk_agent import risk_node
-from .state import ProjectState
-from ..services.notification_service import trim_activity_log, trim_notifications
+from .state import ProjectState, agent_log
+from ..services.notification_service import (
+    filter_notifications_mongo_idempotent,
+    trim_activity_log,
+    trim_notifications,
+)
 
 
 def _derive_kanban(tasks: List[Dict[str, Any]]) -> Dict[str, str]:
     return {str(task.get("id") or ""): str(task.get("status") or "todo") for task in tasks if task.get("id")}
+
+
+def _plan_fingerprint(roadmap: Any, tasks: List[Dict[str, Any]], task_graph: Any) -> str:
+    """Stable hash of planning artifacts for idempotency / skip logic."""
+    task_signatures = sorted(
+        [
+            {
+                "id": str(t.get("id") or ""),
+                "title": str(t.get("title") or ""),
+                "status": str(t.get("status") or ""),
+                "depends_on": t.get("depends_on"),
+            }
+            for t in tasks
+        ],
+        key=lambda x: x["id"],
+    )
+    return _stable_hash({"roadmap": roadmap, "tasks": task_signatures, "task_graph": task_graph})
 
 
 def _normalize_kanban(kanban: Any, tasks: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -39,47 +70,158 @@ def _normalize_kanban(kanban: Any, tasks: List[Dict[str, Any]]) -> Dict[str, str
 
 
 def planning_node(state: ProjectState) -> Dict[str, Any]:
+    wid = str(state.get("workspace_id") or "")
+    agent_log("planner", "start", wid)
+    approval_granted = str(state.get("approval_granted_plan_hash") or "")
+    staged = state.get("staged_plan")
+    if state.get("plan_pending_approval") and isinstance(staged, dict):
+        ph = str(staged.get("plan_hash") or "")
+        if ph and ph != approval_granted:
+            agent_log("planner", "decision", wid, route="staged_plan_awaiting_approval", plan_hash=ph[:16])
+            agent_log("planner", "end", wid)
+            return {}
+        pending = list(state.get("pending_actions") or [])
+        if ph and not any(
+            isinstance(a, dict) and a.get("type") == "apply_plan" and str(a.get("plan_hash") or "") == ph for a in pending
+        ):
+            apply_act: Dict[str, Any] = {
+                "type": "apply_plan",
+                "plan_hash": ph,
+                "requires_approval": True,
+                "payload": {
+                    "tasks": list(staged.get("tasks") or []),
+                    "roadmap": staged.get("roadmap") or {},
+                    "task_graph": staged.get("task_graph") or {"nodes": [], "edges": []},
+                },
+            }
+            apply_act["action_id"] = f"apply_plan:{ph}"
+            apply_act["priority"] = "high"
+            apply_act["created_at"] = datetime.now(timezone.utc).isoformat()
+            pending = [*pending, apply_act][-200:]
+            agent_log("planner", "decision", wid, route="enqueue_approved_plan", plan_hash=ph[:16])
+            agent_log("planner", "end", wid)
+            return {"pending_actions": pending}
+        agent_log("planner", "decision", wid, route="approved_plan_pending_execution")
+        agent_log("planner", "end", wid)
+        return {}
+
     roadmap = state.get("roadmap") or {}
     tasks = list(state.get("tasks") or [])
+    task_graph = state.get("task_graph") or {"nodes": [], "edges": []}
+    prev_hash = state.get("last_plan_hash")
 
     if roadmap.get("phases") and tasks:
-        return {"kanban": _normalize_kanban(state.get("kanban"), tasks)}
+        h = _plan_fingerprint(roadmap, tasks, task_graph)
+        plan_changed = h != prev_hash
+        agent_log("planner", "decision", wid, route="existing_roadmap", plan_changed=plan_changed)
+        agent_log("planner", "end", wid, plan_changed=plan_changed)
+        return {
+            "kanban": _normalize_kanban(state.get("kanban"), tasks),
+            "last_plan_hash": h,
+            "plan_changed": plan_changed,
+        }
 
     prd = state.get("prd") or {}
     team = list(state.get("team") or [])
     if not prd:
+        h = _plan_fingerprint(roadmap, tasks, task_graph)
+        plan_changed = h != prev_hash
+        agent_log("planner", "decision", wid, route="no_prd", plan_changed=plan_changed)
+        agent_log("planner", "end", wid, plan_changed=plan_changed)
         return {
             "roadmap": roadmap,
             "tasks": tasks,
             "kanban": _normalize_kanban(state.get("kanban"), tasks),
+            "last_plan_hash": h,
+            "plan_changed": plan_changed,
         }
 
-    plan = run_planning_agent(prd, team)
+    existing_tasks = list(state.get("tasks") or [])
+    plan = run_planning_agent(
+        prd,
+        team,
+        existing_tasks=existing_tasks,
+    )
     planned_tasks = plan.get("tasks") or []
+    new_roadmap = plan.get("roadmap") or {}
+    new_graph = plan.get("task_graph") or {"nodes": [], "edges": []}
+    h = _plan_fingerprint(new_roadmap, planned_tasks, new_graph)
+    plan_changed = h != prev_hash
+    require_pa = bool(state.get("require_plan_approval", False))
+    old_ids = {str(t.get("id") or "") for t in existing_tasks if t.get("id")}
+    new_ids = {str(t.get("id") or "") for t in planned_tasks if t.get("id")}
+    structural = old_ids != new_ids
+    major = bool(structural or (len(existing_tasks) > 0 and len(planned_tasks) != len(existing_tasks)))
+    bootstrap = len(existing_tasks) == 0
+
+    if require_pa and major and not bootstrap and plan_changed:
+        staged_plan: Dict[str, Any] = {
+            "plan_hash": h,
+            "roadmap": new_roadmap,
+            "tasks": planned_tasks,
+            "task_graph": new_graph,
+        }
+        apply_act: Dict[str, Any] = {
+            "type": "apply_plan",
+            "plan_hash": h,
+            "requires_approval": True,
+            "payload": {
+                "tasks": planned_tasks,
+                "roadmap": new_roadmap,
+                "task_graph": new_graph,
+            },
+        }
+        apply_act["action_id"] = f"apply_plan:{h}"
+        apply_act["priority"] = "high"
+        apply_act["created_at"] = datetime.now(timezone.utc).isoformat()
+        pending = list(state.get("pending_actions") or [])
+        pending = [*pending, apply_act][-200:]
+        agent_log("planner", "decision", wid, route="plan_staged_requires_approval", plan_hash=h[:16])
+        agent_log("planner", "end", wid, plan_changed=True, staged_tasks=len(planned_tasks))
+        return {
+            "roadmap": new_roadmap,
+            "task_graph": new_graph,
+            "staged_plan": staged_plan,
+            "plan_pending_approval": True,
+            "pending_actions": pending,
+            "last_plan_hash": h,
+            "plan_changed": True,
+        }
+
+    agent_log("planner", "end", wid, plan_changed=plan_changed, tasks=len(planned_tasks))
     return {
-        "roadmap": plan.get("roadmap") or {},
+        "roadmap": new_roadmap,
+        "task_graph": new_graph,
         "tasks": planned_tasks,
         "kanban": _derive_kanban(planned_tasks),
+        "last_plan_hash": h,
+        "plan_changed": plan_changed,
+        "plan_pending_approval": False,
+        "staged_plan": None,
     }
 
 
-def _route_after_monitor(state: ProjectState) -> str:
-    if not state.get("monitoring_changed", True):
-        return "end"
+def _route_after_execution_github(state: ProjectState) -> str:
+    """After monitor + execution: use decision layer + guards (Phase 4 completion)."""
+    d = decide_next_action(state)
     if state.get("project_complete"):
         return "notify"
+    if not state.get("monitoring_changed", True) and not state.get("execution_changed", False):
+        return "end"
     if state.get("blockers"):
+        return "risk"
+    if d.get("decision") == "replan":
+        return "risk"
+    if d.get("decision") == "notify" and (state.get("risks") or []):
         return "risk"
     return "end"
 
 
 def _route_after_risk(state: ProjectState) -> str:
-    if not state.get("risks_changed", True):
-        return "end"
-    risks = state.get("risks") or []
-    if any((risk.get("severity") or "").lower() == "high" for risk in risks):
+    d = state.get("decision") or decide_next_action(state)
+    if d.get("decision") == "replan":
         return "replan"
-    if risks:
+    if d.get("decision") == "notify":
         return "notify"
     return "end"
 
@@ -87,20 +229,30 @@ def _route_after_risk(state: ProjectState) -> str:
 def _route_after_replan(state: ProjectState) -> str:
     if not state.get("replan_changed", True):
         return "end"
-    return "monitor"
+    return "exec_replan"
 
 
 builder = StateGraph(ProjectState)
 builder.add_node("plan", planning_node)
+builder.add_node("exec_plan", execution_node)
 builder.add_node("monitor", monitoring_node)
+builder.add_node("exec_github", execution_node)
 builder.add_node("risk", risk_node)
 builder.add_node("replan", replanning_node)
-builder.add_node("notify", notification_node)
+builder.add_node("exec_replan", execution_node)
+builder.add_node("notify", communication_node)
 builder.set_entry_point("plan")
-builder.add_edge("plan", "monitor")
-builder.add_conditional_edges("monitor", _route_after_monitor, {"risk": "risk", "notify": "notify", "end": END})
+builder.add_edge("plan", "exec_plan")
+builder.add_edge("exec_plan", "monitor")
+builder.add_edge("monitor", "exec_github")
+builder.add_conditional_edges(
+    "exec_github",
+    _route_after_execution_github,
+    {"risk": "risk", "notify": "notify", "end": END},
+)
 builder.add_conditional_edges("risk", _route_after_risk, {"replan": "replan", "notify": "notify", "end": END})
-builder.add_conditional_edges("replan", _route_after_replan, {"monitor": "monitor", "end": END})
+builder.add_conditional_edges("replan", _route_after_replan, {"exec_replan": "exec_replan", "end": END})
+builder.add_edge("exec_replan", "notify")
 builder.add_edge("notify", END)
 graph = builder.compile()
 
@@ -122,6 +274,7 @@ def build_graph_state(
         "prd": workspace.get("prd") or {},
         "team": team,
         "roadmap": workspace.get("roadmap") or {},
+        "task_graph": workspace.get("task_graph") or {"nodes": [], "edges": []},
         "tasks": tasks,
         "github_events": github_events or [],
         "kanban": _normalize_kanban(workspace.get("kanban"), tasks),
@@ -140,9 +293,30 @@ def build_graph_state(
         "last_monitoring_hash": workspace.get("last_monitoring_hash"),
         "last_risks_hash": workspace.get("last_risks_hash"),
         "last_replan_hash": workspace.get("last_replan_hash"),
+        "last_plan_hash": workspace.get("last_plan_hash"),
+        "plan_changed": False,
         "monitoring_changed": False,
         "risks_changed": False,
         "replan_changed": False,
+        "pending_actions": list(workspace.get("pending_actions") or []),
+        "applied_action_ids": [str(x) for x in (workspace.get("applied_action_ids") or []) if x],
+        "allow_auto_execute": bool(workspace.get("allow_auto_execute", True)),
+        "require_plan_approval": bool(workspace.get("require_plan_approval", False)),
+        "approval_granted_plan_hash": workspace.get("approval_granted_plan_hash"),
+        "staged_plan": workspace.get("staged_plan"),
+        "plan_pending_approval": bool(workspace.get("plan_pending_approval", False)),
+        "execution_changed": False,
+        "decision": workspace.get("decision") or {},
+        "execution_limit": 10 if workspace.get("execution_limit") is None else int(workspace.get("execution_limit")),
+        "team_metrics": workspace.get("team_metrics") or {},
+        "last_github_activity_at": workspace.get("last_github_activity_at"),
+        "risk_score": float(workspace.get("risk_score") or 0.0),
+        "delay_probability": float(workspace.get("delay_probability") or 0.0),
+        "decision_scores": workspace.get("decision_scores") or {},
+        "historical_metrics": workspace.get("historical_metrics") or {},
+        "allowed_tools": workspace.get("allowed_tools"),
+        "tool_results": list(workspace.get("tool_results") or []),
+        "external_events": list(workspace.get("external_events") or []),
     }
 
 
@@ -167,13 +341,24 @@ async def run_graph_for_workspace(
         if task_id and task_id in kanban:
             task["status"] = kanban[task_id]
 
+    raw_notifications = list(final_state.get("notifications") or [])
+    raw_notifications = await filter_notifications_mongo_idempotent(
+        db,
+        workspace_id,
+        raw_notifications,
+        existing_notifications=list(workspace.get("notifications") or []),
+    )
+
     updates: Dict[str, Any] = {
         "roadmap": final_state.get("roadmap") or {},
+        "task_graph": final_state.get("task_graph")
+        or workspace.get("task_graph")
+        or {"nodes": [], "edges": []},
         "tasks": tasks,
         "kanban": kanban,
         "blockers": final_state.get("blockers") or [],
         "risks": list(final_state.get("risks") or []),
-        "notifications": trim_notifications(final_state.get("notifications") or []),
+        "notifications": trim_notifications(raw_notifications),
         "project_complete": bool(final_state.get("project_complete")),
         "activity_log": trim_activity_log(dedupe_activity_list(final_state.get("activity_log") or [], window_seconds=60)),
         "processed_event_ids": final_state.get("processed_event_ids") or [],
@@ -181,7 +366,30 @@ async def run_graph_for_workspace(
         "last_monitoring_hash": final_state.get("last_monitoring_hash"),
         "last_risks_hash": final_state.get("last_risks_hash"),
         "last_replan_hash": final_state.get("last_replan_hash"),
+        "last_plan_hash": final_state.get("last_plan_hash"),
+        "pending_actions": final_state.get("pending_actions") or [],
+        "applied_action_ids": final_state.get("applied_action_ids") or [],
+        "staged_plan": final_state.get("staged_plan"),
+        "plan_pending_approval": bool(final_state.get("plan_pending_approval", False)),
+        "decision": final_state.get("decision") or {},
+        "execution_limit": (
+            10 if final_state.get("execution_limit") is None else int(final_state.get("execution_limit"))
+        ),
+        "team_metrics": final_state.get("team_metrics") or {},
+        "last_github_activity_at": final_state.get("last_github_activity_at"),
+        "risk_score": float(final_state.get("risk_score") or 0.0),
+        "delay_probability": float(final_state.get("delay_probability") or 0.0),
+        "decision_scores": final_state.get("decision_scores") or {},
+        "allowed_tools": final_state.get("allowed_tools"),
+        "tool_results": final_state.get("tool_results") or [],
+        "external_events": final_state.get("external_events") or [],
     }
+
+    hist = update_historical_metrics(workspace, tasks)
+    fs_hist = final_state.get("historical_metrics") or {}
+    if fs_hist.get("replan_recent") is not None:
+        hist["replan_recent"] = fs_hist["replan_recent"]
+    updates["historical_metrics"] = hist
 
     github_repo = final_state.get("github_repo") or {}
     if github_repo.get("repo_full_name"):

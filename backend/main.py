@@ -11,7 +11,8 @@ from .routers import github as github_router
 from .routers import ai_insights as ai_insights_router
 from .routers import notifications as notifications_router
 from .agents.graph import monitoring_loop
-from .services.notification_service import reset_workspace_signal_data_once
+from .database import get_db
+from .services.notification_service import ensure_notification_dedupe_index, reset_workspace_signal_data_once
 
 app = FastAPI(title="ProjectAI Backend")
 
@@ -28,6 +29,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def start_monitoring_loop() -> None:
+    await ensure_notification_dedupe_index(get_db())
     await reset_workspace_signal_data_once()
     # Fire-and-forget background monitoring loop
     asyncio.create_task(monitoring_loop())

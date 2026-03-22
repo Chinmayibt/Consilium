@@ -12,9 +12,10 @@ from reportlab.pdfgen import canvas
 from ..agents.requirements_agent import run_requirements_agent
 from ..agents.planning_agent import run_planning_agent
 from ..database import get_db
-from ..dependencies import get_current_user
+from ..dependencies import ensure_workspace_access, get_current_user
 from ..services.notification_service import trim_activity_log, trim_notifications
 from ..services.kanban_service import KANBAN_STATUSES, build_kanban
+from ..services.planning_history_retrieval import retrieve_similar_task_evidence
 
 
 router = APIRouter(prefix="/api/workspaces", tags=["requirements"])
@@ -43,19 +44,12 @@ async def generate_prd_for_workspace(
     payload: GeneratePrdRequest,
     current_user=Depends(get_current_user),
 ) -> GeneratePrdResponse:
+    workspace = await ensure_workspace_access(
+        workspace_id, current_user, min_role="member"
+    )
+    oid = workspace["_id"]
     db = get_db()
     workspaces = db["workspaces"]
-
-    try:
-        oid = ObjectId(workspace_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid workspace id")
-
-    workspace = await workspaces.find_one({"_id": oid})
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    # TODO: enforce that current_user is a member/owner of this workspace if desired
 
     prd = await _run_agent_async(payload)
 
@@ -150,17 +144,12 @@ async def finalize_workspace_prd(
     workspace_id: str,
     current_user=Depends(get_current_user),
 ) -> FinalizePrdResponse:
+    workspace = await ensure_workspace_access(
+        workspace_id, current_user, min_role="member"
+    )
+    oid = workspace["_id"]
     db = get_db()
     workspaces = db["workspaces"]
-
-    try:
-        oid = ObjectId(workspace_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid workspace id")
-
-    workspace = await workspaces.find_one({"_id": oid})
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
 
     prd = workspace.get("prd")
     if not prd:
@@ -169,10 +158,30 @@ async def finalize_workspace_prd(
     print("PRD FOUND:", prd)
     print("RUNNING PLANNING AGENT")
 
+    history_block, history_meta = await retrieve_similar_task_evidence(
+        db,
+        exclude_workspace_id=workspace_id,
+        prd=prd,
+        top_k=14,
+        max_workspaces=120,
+    )
+    history_meta_slim = {
+        "retrieved_count": history_meta.get("retrieved_count", 0),
+        "anchor_median_hours": history_meta.get("anchor_median_hours"),
+    }
+
     from anyio import to_thread
 
     def _run() -> Dict[str, Any]:
-        return run_planning_agent(prd, workspace.get("members", []))
+        return run_planning_agent(
+            prd,
+            workspace.get("members", []),
+            existing_tasks=list(workspace.get("tasks") or []),
+            history_context=history_block or None,
+            historical_anchor_hours=history_meta.get("anchor_median_hours"),
+            historical_title_norms=history_meta.get("title_norms") or set(),
+            history_meta=history_meta_slim,
+        )
 
     plan = await to_thread.run_sync(_run)
     print("PLANNING AGENT OUTPUT:", plan)
@@ -197,6 +206,7 @@ async def finalize_workspace_prd(
                 "roadmap": roadmap,
                 "tasks": tasks,
                 "kanban": kanban,
+                "task_graph": plan.get("task_graph") or {"nodes": [], "edges": []},
                 "plan_generated": True,
             }
         },

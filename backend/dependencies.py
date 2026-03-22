@@ -1,4 +1,4 @@
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from bson import ObjectId
 from fastapi import Cookie, HTTPException, Header, status
@@ -6,6 +6,13 @@ from pymongo.collection import Collection
 
 from .auth import decode_token
 from .database import get_db
+from .services.workspace_access import (
+    is_workspace_member,
+    meets_min_role,
+    resolve_effective_role,
+)
+
+WorkspaceMinRole = Literal["viewer", "member", "admin"]
 
 
 def get_users_collection() -> Collection:
@@ -56,8 +63,16 @@ async def get_current_user(
     return doc
 
 
-async def ensure_workspace_member(workspace_id: str, current_user: dict):
-    """Raise 403 if current_user is not a member of the workspace."""
+async def ensure_workspace_access(
+    workspace_id: str,
+    current_user: dict,
+    *,
+    min_role: WorkspaceMinRole = "viewer",
+) -> dict:
+    """
+    Load workspace, require membership, and enforce minimum role
+    (viewer < member < admin). Owner is always admin.
+    """
     db = get_db()
     workspaces = db["workspaces"]
     try:
@@ -70,15 +85,31 @@ async def ensure_workspace_member(workspace_id: str, current_user: dict):
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     uid = str(current_user["_id"])
-    if uid != ws.get("owner_id") and not any(
-        m.get("user_id") == uid for m in ws.get("members", [])
-    ):
+    if not is_workspace_member(ws, uid):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not a member of this workspace",
         )
 
+    role = resolve_effective_role(ws, uid)
+    if role is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not a member of this workspace",
+        )
+
+    if not meets_min_role(role, min_role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"This action requires '{min_role}' workspace access or higher",
+        )
+
     return ws
+
+
+async def ensure_workspace_member(workspace_id: str, current_user: dict) -> dict:
+    """Member check with viewer-level access (read-only capable roles)."""
+    return await ensure_workspace_access(workspace_id, current_user, min_role="viewer")
 
 
 

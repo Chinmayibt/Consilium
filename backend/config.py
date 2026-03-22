@@ -39,6 +39,16 @@ class Settings(BaseSettings):
 
     GEMINI_API_KEY: str | None = Field(default=None, env="GEMINI_API_KEY")
 
+    # Phase 6: external tools (optional)
+    SLACK_BOT_TOKEN: str | None = Field(default=None, env="SLACK_BOT_TOKEN")
+    SLACK_DEFAULT_CHANNEL: str | None = Field(default=None, env="SLACK_DEFAULT_CHANNEL")
+    NOTION_INTEGRATION_TOKEN: str | None = Field(default=None, env="NOTION_INTEGRATION_TOKEN")
+    NOTION_API_VERSION: str = Field(default="2022-06-28", env="NOTION_API_VERSION")
+    NOTION_DEFAULT_PARENT_ID: str | None = Field(default=None, env="NOTION_DEFAULT_PARENT_ID")
+    GOOGLE_CALENDAR_ACCESS_TOKEN: str | None = Field(default=None, env="GOOGLE_CALENDAR_ACCESS_TOKEN")
+    GOOGLE_CALENDAR_ID: str = Field(default="primary", env="GOOGLE_CALENDAR_ID")
+    CALENDAR_EVENTS_WEBHOOK_URL: str | None = Field(default=None, env="CALENDAR_EVENTS_WEBHOOK_URL")
+
     model_config = SettingsConfigDict(
         env_file=BASE_DIR / ".env",
         env_file_encoding="utf-8",

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from .monitoring_agent import _stable_hash
+from .state import agent_log
 from ..services.notification_service import create_notification, trim_notifications
 
 
@@ -15,7 +16,13 @@ def _new_notification(notification_type: str, message: str, **kwargs: Any) -> Di
     return create_notification(kwargs.pop("user_id", None), message, notification_type, **kwargs)
 
 
-def notification_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def communication_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Communication agent: fan-in notifications (project / blockers / risks).
+    Pure state in → state delta out; persistence happens in graph runner.
+    """
+    wid = str(state.get("workspace_id") or "")
+    agent_log("communication", "start", wid)
     notifications: List[Dict[str, Any]] = list(state.get("notifications") or [])
     recent_ids = {str(item.get("event_id") or "") for item in notifications[-50:] if item.get("event_id")}
 
@@ -40,6 +47,8 @@ def notification_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "Project completed. All tasks have been finished.",
             )
         )
+        agent_log("communication", "decision", wid, kind="project_complete")
+        agent_log("communication", "end", wid, appended=1)
         return {"notifications": trim_notifications(notifications)}
 
     for blocker in (state.get("blockers") or [])[:5]:
@@ -63,4 +72,14 @@ def notification_node(state: Dict[str, Any]) -> Dict[str, Any]:
             )
         )
 
+    agent_log(
+        "communication",
+        "end",
+        wid,
+        total_notifications=len(notifications),
+    )
     return {"notifications": trim_notifications(notifications)}
+
+
+# Back-compat alias (same node, multi-agent naming)
+notification_node = communication_node
