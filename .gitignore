@@ -47,3 +47,6 @@ pnpm-debug.log*
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Local exports / dumps
+database_export.json
