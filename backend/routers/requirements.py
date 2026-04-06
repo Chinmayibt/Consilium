@@ -33,6 +33,57 @@ class GeneratePrdRequest(BaseModel):
 class GeneratePrdResponse(BaseModel):
     prd: Dict[str, Any]
 
+_PRD_TEXT_FIELDS = (
+    "overview",
+    "problem_statement",
+)
+
+_PRD_LIST_FIELDS = (
+    "target_users",
+    "market_analysis",
+    "features",
+    "user_stories",
+    "functional_requirements",
+    "non_functional_requirements",
+    "tech_stack",
+    "system_architecture",
+    "database_design",
+    "api_design",
+    "security",
+    "performance",
+    "deployment",
+    "folder_structure",
+    "milestones",
+    "mvp_scope",
+    "future_enhancements",
+)
+
+
+def _normalize_prd(prd: Dict[str, Any] | None) -> Dict[str, Any]:
+    """Ensure PRD always matches the frontend's expected shape."""
+    src = prd if isinstance(prd, dict) else {}
+    normalized: Dict[str, Any] = {}
+
+    for key in _PRD_TEXT_FIELDS:
+        value = src.get(key, "")
+        normalized[key] = value if isinstance(value, str) else str(value or "")
+
+    for key in _PRD_LIST_FIELDS:
+        value = src.get(key, [])
+        if isinstance(value, list):
+            normalized[key] = [str(item).strip() for item in value if str(item).strip()]
+        elif isinstance(value, str):
+            normalized[key] = [line.strip() for line in value.splitlines() if line.strip()]
+        else:
+            normalized[key] = []
+
+    # Preserve extra keys from agent output for debugging/inspection.
+    for key, value in src.items():
+        if key not in normalized:
+            normalized[key] = value
+
+    return normalized
+
 
 @router.post(
     "/{workspace_id}/generate-prd",
@@ -51,7 +102,7 @@ async def generate_prd_for_workspace(
     db = get_db()
     workspaces = db["workspaces"]
 
-    prd = await _run_agent_async(payload)
+    prd = _normalize_prd(await _run_agent_async(payload))
 
     # Save PRD only; roadmap is generated when PRD is finalized
     await workspaces.update_one(
@@ -96,7 +147,7 @@ async def get_workspace_prd(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     return PrdResponse(
-        prd=workspace.get("prd"),
+        prd=_normalize_prd(workspace.get("prd")),
         prd_status=workspace.get("prd_status", "draft"),
     )
 
@@ -124,7 +175,7 @@ async def save_workspace_prd(
 
     await workspaces.update_one(
         {"_id": oid},
-        {"$set": {"prd": payload.prd, "prd_status": "draft"}},
+        {"$set": {"prd": _normalize_prd(payload.prd), "prd_status": "draft"}},
     )
 
     return None
@@ -151,7 +202,7 @@ async def finalize_workspace_prd(
     db = get_db()
     workspaces = db["workspaces"]
 
-    prd = workspace.get("prd")
+    prd = _normalize_prd(workspace.get("prd"))
     if not prd:
         raise HTTPException(status_code=400, detail="No PRD to finalize")
 
