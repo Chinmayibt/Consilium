@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 import {
@@ -14,19 +14,43 @@ import {
 } from "@dnd-kit/core";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Clock, GitBranch, Flag } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Clock, GitBranch, Flag, Pencil, Plus } from "lucide-react";
+import { toast } from "sonner";
 import {
   fetchWorkspaceKanban,
   updateWorkspaceTaskStatus,
+  createWorkspaceTask,
   type RoadmapTask,
   type KanbanColumn,
 } from "@/api/workspaces";
 
-const COLUMN_IDS = ["backlog", "todo", "in_progress", "review", "blocked", "done"] as const;
+function taskRowId(task: RoadmapTask): string {
+  return String(task.id ?? task.title ?? "");
+}
+
+const COLUMN_IDS = ["todo", "in_progress", "review", "blocked", "done"] as const;
 type ColumnId = (typeof COLUMN_IDS)[number];
 
 const columnConfig: { id: ColumnId; label: string; color: string }[] = [
-  { id: "backlog", label: "Backlog", color: "bg-muted-foreground/30" },
   { id: "todo", label: "To Do", color: "bg-slate-500" },
   { id: "in_progress", label: "In Progress", color: "bg-primary" },
   { id: "review", label: "Review", color: "bg-amber-500" },
@@ -59,9 +83,11 @@ function priorityColor(priority: string | undefined): string {
 function KanbanCard({
   task,
   isOverlay = false,
+  onEdit,
 }: {
   task: RoadmapTask;
   isOverlay?: boolean;
+  onEdit?: (task: RoadmapTask) => void;
 }) {
   const assignedName = task.assigned_name ?? task.assigned_to_name ?? "Unassigned";
   const priority = task.priority ?? "medium";
@@ -72,7 +98,25 @@ function KanbanCard({
         isOverlay ? "shadow-lg ring-2 ring-primary/30 rotate-2 scale-[1.02]" : "hover:shadow-md hover:border-primary/30 transition-all"
       }`}
     >
-      <p className="text-sm font-semibold leading-snug">{task.title}</p>
+      <div className="flex items-start gap-2">
+        <p className="text-sm font-semibold leading-snug flex-1 min-w-0">{task.title}</p>
+        {onEdit && !isOverlay && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit(task);
+            }}
+            aria-label="Edit task"
+          >
+            <Pencil className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
       {(task as RoadmapTask & { github_pr?: number }).github_pr != null && (
         <div className="flex items-center gap-1.5 text-muted-foreground">
           <GitBranch className="h-3.5 w-3.5 text-primary/70" />
@@ -125,12 +169,14 @@ function DroppableColumn({
   color,
   tasks,
   taskCount,
+  onEditTask,
 }: {
   id: ColumnId;
   label: string;
   color: string;
   tasks: RoadmapTask[];
   taskCount: number;
+  onEditTask?: (task: RoadmapTask) => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const column = columnConfig.find((c) => c.id === id)!;
@@ -151,7 +197,7 @@ function DroppableColumn({
       </div>
       <div className="space-y-3 min-h-[120px]">
         {tasks.map((task) => (
-          <DraggableTask key={task.id ?? task.title} task={task} />
+          <DraggableTask key={taskRowId(task)} task={task} onEdit={onEditTask} />
         ))}
         {tasks.length === 0 && (
           <div className="h-24 rounded-xl border-2 border-dashed border-border/60 flex items-center justify-center">
@@ -163,8 +209,14 @@ function DroppableColumn({
   );
 }
 
-function DraggableTask({ task }: { task: RoadmapTask }) {
-  const id = task.id ?? task.title ?? "";
+function DraggableTask({
+  task,
+  onEdit,
+}: {
+  task: RoadmapTask;
+  onEdit?: (task: RoadmapTask) => void;
+}) {
+  const id = taskRowId(task);
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id,
     data: { task },
@@ -177,7 +229,7 @@ function DraggableTask({ task }: { task: RoadmapTask }) {
       {...attributes}
       className={isDragging ? "opacity-50" : ""}
     >
-      <KanbanCard task={task} />
+      <KanbanCard task={task} onEdit={onEdit} />
     </div>
   );
 }
@@ -186,6 +238,16 @@ export default function KanbanPage() {
   const { workspaceId } = useParams<{ workspaceId: string }>();
   const queryClient = useQueryClient();
   const [activeTask, setActiveTask] = useState<RoadmapTask | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [addTitle, setAddTitle] = useState("");
+  const [addDescription, setAddDescription] = useState("");
+  const [addStatus, setAddStatus] = useState<ColumnId>("todo");
+  const [addPriority, setAddPriority] = useState("medium");
+  const [editOpen, setEditOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<RoadmapTask | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editStatus, setEditStatus] = useState<ColumnId>("todo");
 
   const { data, isLoading } = useQuery({
     queryKey: ["workspace-kanban", workspaceId],
@@ -193,17 +255,15 @@ export default function KanbanPage() {
     queryFn: () => fetchWorkspaceKanban(workspaceId!),
   });
 
-  useEffect(() => {
-    if (data?.tasks?.length) {
-      console.log("[Kanban] tasks from API:", data.tasks.map((t) => ({
-        id: t.id,
-        title: t.title,
-        status: t.status,
-        assigned_user_id: t.assigned_user_id ?? t.assigned_to,
-        assigned_name: t.assigned_name ?? t.assigned_to_name,
-      })));
-    }
-  }, [data?.tasks]);
+  const kanbanQueryKey = ["workspace-kanban", workspaceId] as const;
+
+  const extractApiDetail = (err: unknown): string => {
+    const ax = err as { response?: { data?: { detail?: unknown } } };
+    const d = ax.response?.data?.detail;
+    if (typeof d === "string") return d;
+    if (Array.isArray(d)) return d.map((x) => JSON.stringify(x)).join("; ");
+    return "Request failed";
+  };
 
   const updateStatusMutation = useMutation({
     mutationFn: ({
@@ -214,17 +274,14 @@ export default function KanbanPage() {
       status: string;
     }) => updateWorkspaceTaskStatus(workspaceId!, taskId, { status }),
     onMutate: async ({ taskId, status }) => {
-      await queryClient.cancelQueries({ queryKey: ["workspace-kanban", workspaceId] });
-      const prev = queryClient.getQueryData<{ kanban: KanbanColumn; tasks: RoadmapTask[] }>([
-        "workspace-kanban",
-        workspaceId,
-      ]);
+      await queryClient.cancelQueries({ queryKey: kanbanQueryKey });
+      const prev = queryClient.getQueryData<{ kanban: KanbanColumn; tasks: RoadmapTask[] }>(kanbanQueryKey);
       if (!prev) return { prev };
       const kanban = { ...prev.kanban } as KanbanColumn;
       let moved: RoadmapTask | null = null;
       for (const key of COLUMN_IDS) {
         const list = kanban[key] ?? [];
-        const idx = list.findIndex((t) => (t.id ?? t.title) === taskId);
+        const idx = list.findIndex((t) => taskRowId(t) === taskId);
         if (idx >= 0) {
           moved = list[idx];
           kanban[key] = [...list.slice(0, idx), ...list.slice(idx + 1)];
@@ -235,22 +292,70 @@ export default function KanbanPage() {
         const updated = { ...moved, status };
         const targetList = kanban[status as ColumnId] ?? [];
         kanban[status as ColumnId] = [...targetList, updated];
-        queryClient.setQueryData(["workspace-kanban", workspaceId], {
+        queryClient.setQueryData(kanbanQueryKey, {
           ...prev,
           kanban,
         });
       }
       return { prev };
     },
-    onError: (_err, _vars, context) => {
+    onError: (err, _vars, context) => {
       if (context?.prev) {
-        queryClient.setQueryData(["workspace-kanban", workspaceId], context.prev);
+        queryClient.setQueryData(kanbanQueryKey, context.prev);
       }
+      toast.error(extractApiDetail(err));
     },
     onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ["workspace-kanban", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: kanbanQueryKey });
     },
   });
+
+  const createTaskMutation = useMutation({
+    mutationFn: () =>
+      createWorkspaceTask(workspaceId!, {
+        title: addTitle.trim(),
+        description: addDescription.trim() || undefined,
+        status: addStatus,
+        priority: addPriority,
+      }),
+    onSuccess: () => {
+      toast.success("Task added");
+      setAddOpen(false);
+      setAddTitle("");
+      setAddDescription("");
+      setAddStatus("todo");
+      setAddPriority("medium");
+    },
+    onError: (err) => toast.error(extractApiDetail(err)),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: kanbanQueryKey }),
+  });
+
+  const saveEditMutation = useMutation({
+    mutationFn: () => {
+      if (!editingTask || !workspaceId) throw new Error("No task");
+      return updateWorkspaceTaskStatus(workspaceId, taskRowId(editingTask), {
+        title: editTitle.trim(),
+        description: editDescription,
+        status: editStatus,
+      });
+    },
+    onSuccess: () => {
+      toast.success("Task updated");
+      setEditOpen(false);
+      setEditingTask(null);
+    },
+    onError: (err) => toast.error(extractApiDetail(err)),
+    onSettled: () => queryClient.invalidateQueries({ queryKey: kanbanQueryKey }),
+  });
+
+  const openEdit = useCallback((task: RoadmapTask) => {
+    setEditingTask(task);
+    setEditTitle(task.title);
+    setEditDescription(String(task.description ?? ""));
+    const st = (task.status || "todo").toLowerCase();
+    setEditStatus((COLUMN_IDS.includes(st as ColumnId) ? st : "todo") as ColumnId);
+    setEditOpen(true);
+  }, []);
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -261,7 +366,6 @@ export default function KanbanPage() {
   const kanban = useMemo(() => {
     const k = data?.kanban ?? {};
     return {
-      backlog: (k.backlog ?? []) as RoadmapTask[],
       todo: (k.todo ?? []) as RoadmapTask[],
       in_progress: (k.in_progress ?? []) as RoadmapTask[],
       review: (k.review ?? []) as RoadmapTask[],
@@ -290,16 +394,22 @@ export default function KanbanPage() {
 
   return (
     <div className="page-container animate-fade-in">
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-4 flex-wrap">
         <div>
           <h1>Kanban Board</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Drag tasks between columns to update status
+            Drag cards between columns, or use Add / Edit to manage tasks
           </p>
         </div>
-        <Badge variant="secondary" className="text-[10px] bg-primary/10 text-primary">
-          Live Sync
-        </Badge>
+        <div className="flex items-center gap-2">
+          <Button type="button" size="sm" onClick={() => setAddOpen(true)} className="gap-1.5">
+            <Plus className="h-4 w-4" />
+            Add task
+          </Button>
+          <Badge variant="secondary" className="text-[10px] bg-primary/10 text-primary">
+            Live Sync
+          </Badge>
+        </div>
       </div>
 
       {isLoading && (
@@ -329,6 +439,7 @@ export default function KanbanPage() {
                 color={color}
                 tasks={kanban[id]}
                 taskCount={kanban[id].length}
+                onEditTask={openEdit}
               />
             ))}
           </div>
@@ -341,9 +452,138 @@ export default function KanbanPage() {
 
       {!isLoading && data && data.tasks?.length === 0 && (
         <p className="text-sm text-muted-foreground mt-8 text-center bg-muted/30 py-8 rounded-xl border border-border/50">
-          No tasks yet. Finalize a PRD to generate tasks and populate the board.
+          No tasks yet. Use <strong>Add task</strong> above or finalize a PRD to generate tasks.
         </p>
       )}
+
+      <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>New task</DialogTitle>
+            <DialogDescription>Add a task to this workspace. It will appear in the column you choose.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="add-title">Title</Label>
+              <Input
+                id="add-title"
+                value={addTitle}
+                onChange={(e) => setAddTitle(e.target.value)}
+                placeholder="Short task title"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="add-desc">Description (optional)</Label>
+              <Textarea
+                id="add-desc"
+                value={addDescription}
+                onChange={(e) => setAddDescription(e.target.value)}
+                placeholder="Details, acceptance criteria…"
+                rows={3}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>Column</Label>
+                <Select value={addStatus} onValueChange={(v) => setAddStatus(v as ColumnId)}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {columnConfig.map((c) => (
+                      <SelectItem key={c.id} value={c.id}>
+                        {c.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Priority</Label>
+                <Select value={addPriority} onValueChange={setAddPriority}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="low">Low</SelectItem>
+                    <SelectItem value="medium">Medium</SelectItem>
+                    <SelectItem value="high">High</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setAddOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!addTitle.trim() || createTaskMutation.isPending}
+              onClick={() => createTaskMutation.mutate()}
+            >
+              {createTaskMutation.isPending ? "Saving…" : "Create task"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={editOpen}
+        onOpenChange={(open) => {
+          setEditOpen(open);
+          if (!open) setEditingTask(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit task</DialogTitle>
+            <DialogDescription>Update title, description, or column. Changes save to the workspace.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="edit-title">Title</Label>
+              <Input id="edit-title" value={editTitle} onChange={(e) => setEditTitle(e.target.value)} />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="edit-desc">Description</Label>
+              <Textarea
+                id="edit-desc"
+                value={editDescription}
+                onChange={(e) => setEditDescription(e.target.value)}
+                rows={3}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>Column</Label>
+              <Select value={editStatus} onValueChange={(v) => setEditStatus(v as ColumnId)}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {columnConfig.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              disabled={!editTitle.trim() || saveEditMutation.isPending}
+              onClick={() => saveEditMutation.mutate()}
+            >
+              {saveEditMutation.isPending ? "Saving…" : "Save changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -12,8 +12,10 @@ from typing import Any, ClassVar, Dict
 import httpx
 
 from ..config import settings
+from ..agents.mcp_tools import MCPToolExecutor
 
 logger = logging.getLogger(__name__)
+_mcp_executor = MCPToolExecutor()
 
 
 def log_tool_event(
@@ -272,6 +274,9 @@ def execute_tool_action(action: Dict[str, Any], context: Dict[str, Any]) -> Dict
     tool_name = str(action.get("tool") or "").lower().strip()
     operation = str(action.get("operation") or "")
     workspace_id = str(context.get("workspace_id") or "")
+
+    if tool_name.startswith("mcp/"):
+        return _mcp_executor.run(action, context)
 
     if tool_name not in TOOLS:
         log_tool_event(workspace_id, tool_name or "?", operation, "error", error="unknown_tool")

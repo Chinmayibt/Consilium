@@ -5,12 +5,17 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError
+from pydantic import BaseModel
 
 from ..auth import create_access_token, create_refresh_token, decode_token, hash_password, verify_password
 from ..database import get_db
 from ..models.user import UserCreate, UserPublic
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+class RefreshRequest(BaseModel):
+    refresh_token: Optional[str] = None
+
+
 
 
 def get_users_collection() -> Collection:
@@ -107,11 +112,13 @@ async def login(
 async def refresh(
     response: Response,
     refresh_token: Optional[str] = Cookie(default=None),
+    payload: Optional[RefreshRequest] = None,
 ) -> Dict[str, Any]:
-    if not refresh_token:
+    token = refresh_token or (payload.refresh_token if payload else None)
+    if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
 
-    user_id = decode_token(refresh_token, refresh=True)
+    user_id = decode_token(token, refresh=True)
     if not user_id:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
 

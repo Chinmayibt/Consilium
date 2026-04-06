@@ -10,8 +10,21 @@ from typing import Any, Dict, List, Set, Tuple
 from github import Github
 
 from .state import agent_log
+from ..services.kanban_service import ensure_task_ids as _kanban_ensure_task_ids
+from ..services.kanban_service import task_identity as _task_identity
 from ..services.notification_service import create_notification, trim_activity_log, trim_notifications
 from ..services.tool_registry import execute_tool_action
+
+from .ai_task_mapper import map_commit_to_task_ai, infer_task_status_ai
+from .mcp_tools import (
+    MCPToolExecutor,
+    make_github_issue_action,
+    make_kanban_move_action,
+    make_notification_action,
+    make_calendar_review_action,
+)
+
+_mcp_executor = MCPToolExecutor()
 
 _decision_logger = logging.getLogger(__name__)
 
@@ -21,6 +34,7 @@ _LOW_PROGRESS_THRESHOLD = 0.25
 _PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 _DEFAULT_EXECUTION_LIMIT = 10
 _MAX_MUTATIONS_PER_RUN = 6
+_MAX_TOOL_RETRIES = 3
 
 # Phase 5: scoring weights (explainable heuristics)
 _FRESHNESS_WINDOW_DAYS = 7
@@ -43,6 +57,10 @@ def _parse_iso_datetime(ts: Any) -> datetime | None:
 def _task_effective_status(task: Dict[str, Any], kanban: Dict[str, Any]) -> str:
     tid = str(task.get("id") or "")
     return str(kanban.get(tid) or task.get("status") or "todo")
+
+
+def _ensure_task_ids(tasks: List[Dict[str, Any]]) -> None:
+    _kanban_ensure_task_ids(tasks)
 
 
 def _clamp01(x: float) -> float:
@@ -417,15 +435,9 @@ def decide_next_action(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if rule_pkg.get("reason") == "project_complete":
         out = {**rule_pkg, **base_extra}
-        log_decision_made(wid, out, inputs)
-        return out
-
-    if rule_pkg["decision"] == "replan":
+    elif rule_pkg["decision"] == "replan":
         out = {**rule_pkg, **base_extra}
-        log_decision_made(wid, out, inputs)
-        return out
-
-    if best_score >= _SCORE_CONFIDENCE_FLOOR:
+    elif best_score >= _SCORE_CONFIDENCE_FLOOR:
         pr = "high" if chosen == "replan" else ("medium" if chosen == "notify" else "low")
         out = {
             "decision": chosen,
@@ -433,10 +445,13 @@ def decide_next_action(state: Dict[str, Any]) -> Dict[str, Any]:
             "priority": pr,
             **base_extra,
         }
-        log_decision_made(wid, out, inputs)
-        return out
+    else:
+        out = {**rule_pkg, **base_extra}
 
-    out = {**rule_pkg, **base_extra}
+    pending_actions = list(state.get("pending_actions") or [])
+    _maybe_schedule_review(state, health, pending_actions)
+    if pending_actions != list(state.get("pending_actions") or []):
+        out["pending_actions"] = pending_actions
     log_decision_made(wid, out, inputs)
     return out
 
@@ -676,6 +691,19 @@ def _sort_pending_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return sorted(actions, key=lambda a: (-_priority_value(a), str(a.get("created_at") or "")))
 
 
+def _validate_tool_call_action(action: Dict[str, Any]) -> Tuple[bool, str]:
+    tool = str(action.get("tool") or "").strip()
+    operation = str(action.get("operation") or "").strip()
+    if not tool:
+        return False, "missing_tool"
+    if not operation:
+        return False, "missing_operation"
+    params = action.get("params")
+    if params is not None and not isinstance(params, dict):
+        return False, "invalid_params"
+    return True, ""
+
+
 def _defer_low_priority_if_backlogged(sorted_actions: List[Dict[str, Any]], backlog_threshold: int = 15) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """When queue is large, process high first and defer low to a later run."""
     if len(sorted_actions) <= backlog_threshold:
@@ -717,6 +745,7 @@ def execution_node(state: Dict[str, Any]) -> Dict[str, Any]:
     applied_ids = list(state.get("applied_action_ids") or [])
     applied_set = set(applied_ids)
     tasks = [dict(t) for t in state.get("tasks") or []]
+    _ensure_task_ids(tasks)
     kanban = dict(state.get("kanban") or {})
     blockers = list(state.get("blockers") or [])
     activity_log = list(state.get("activity_log") or [])
@@ -774,6 +803,7 @@ def execution_node(state: Dict[str, Any]) -> Dict[str, Any]:
             payload = act.get("payload") or {}
             try:
                 new_tasks = [dict(x) for x in (payload.get("tasks") or [])]
+                _ensure_task_ids(new_tasks)
                 tasks = new_tasks
                 kanban = _derive_kanban_from_tasks(tasks)
                 result_extras["roadmap"] = payload.get("roadmap") or {}
@@ -798,6 +828,35 @@ def execution_node(state: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         if atype == "tool_call":
+            valid, reason = _validate_tool_call_action(act)
+            if not valid:
+                failures += 1
+                tool_results.append(
+                    {
+                        "action_id": aid,
+                        "tool": act.get("tool"),
+                        "operation": act.get("operation"),
+                        "status": "error",
+                        "ok": False,
+                        "at": _utc_now_iso(),
+                        "error": reason,
+                    }
+                )
+                tool_results = tool_results[-50:]
+                applied_set.add(aid)
+                agent_log("execution", "decision", wid, route="tool_call_invalid", reason=reason)
+                continue
+            if bool(act.get("requires_approval")) and require_plan:
+                if not plan_hash_act or plan_hash_act != approval_hash:
+                    remaining.append(act)
+                    agent_log(
+                        "execution",
+                        "decision",
+                        wid,
+                        route="tool_call_await_approval",
+                        plan_hash=plan_hash_act[:16] if plan_hash_act else "",
+                    )
+                    continue
             if not allow:
                 remaining.append(act)
                 agent_log("execution", "decision", wid, route="auto_execute_disabled", action_type="tool_call")
@@ -821,6 +880,7 @@ def execution_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     "at": _utc_now_iso(),
                     "data": res.get("data"),
                     "error": res.get("error"),
+                "retry_count": int(act.get("retry_count") or 0),
                 }
             )
             tool_results = tool_results[-50:]
@@ -836,10 +896,36 @@ def execution_node(state: Dict[str, Any]) -> Dict[str, Any]:
                         }
                     )
             external_events = external_events[-100:]
-            applied_set.add(aid)
-            executed_n += 1
-            if not res.get("ok") and str(res.get("status")) not in ("skipped", "forbidden"):
+            status_text = str(res.get("status") or "")
+            is_retryable_error = (not res.get("ok")) and status_text not in ("skipped", "forbidden")
+            if is_retryable_error:
+                retries = int(act.get("retry_count") or 0) + 1
                 failures += 1
+                if retries < _MAX_TOOL_RETRIES:
+                    remaining.append(
+                        {
+                            **act,
+                            "retry_count": retries,
+                            "last_error": str(res.get("error") or status_text or "tool_error"),
+                            "deferred_reason": "tool_retry",
+                        }
+                    )
+                else:
+                    applied_set.add(aid)
+                    activity_log = append_activity_once(
+                        activity_log,
+                        "TOOL_CALL_FAILED",
+                        f"Tool call failed after {retries} attempts: {act.get('tool')}:{act.get('operation')}",
+                        entity_id=wid,
+                        metadata={
+                            "tool": str(act.get("tool") or ""),
+                            "operation": str(act.get("operation") or ""),
+                            "error": str(res.get("error") or "")[:200],
+                        },
+                    )
+            else:
+                applied_set.add(aid)
+            executed_n += 1
             agent_log(
                 "execution",
                 "decision",
@@ -1014,55 +1100,31 @@ def _max_github_timestamp_iso(events_list: List[Dict[str, Any]]) -> str | None:
     return best.isoformat() if best else None
 
 
-def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
+def _monitoring_node_event_loop(
+    events: List[Dict[str, Any]],
+    tasks: List[Dict[str, Any]],
+    task_lookup: Dict[str, int],
+    processed_event_ids: set[str],
+    state: Dict[str, Any],
+    wid: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool, int]:
     """
-    Observe GitHub activity and enqueue Phase 4 pending_actions (execution_node applies them).
+    Drop-in replacement for event-processing loop in monitoring_node().
+    Returns (updates, new_actions, status_changed, blocker_count).
     """
-    wid = str(state.get("workspace_id") or "")
-    agent_log("monitor", "start", wid, events=len(state.get("github_events") or []))
-    if state.get("project_complete"):
-        agent_log("monitor", "decision", wid, route="project_complete_skip")
-        agent_log("monitor", "end", wid, monitoring_changed=False)
-        return {"monitoring_changed": False}
-
-    github_repo = state.get("github_repo") or {}
-    tasks = [dict(task) for task in state.get("tasks") or []]
-    processed_event_ids = set(state.get("processed_event_ids") or [])
-    pending_actions = list(state.get("pending_actions") or [])
-
-    events = list(state.get("github_events") or [])
-    commits = [event for event in events if event.get("type") == "commit"]
-    pull_requests = [event for event in events if event.get("type") == "pull_request"]
-
-    if not events and github_repo.get("access_token") and github_repo.get("repo_owner") and github_repo.get("repo_name"):
-        _, commits, pull_requests = fetch_github_activity(
-            github_repo["repo_owner"],
-            github_repo["repo_name"],
-            github_repo["access_token"],
-        )
-        events = [*commits, *pull_requests]
-
-    activity_hash = _stable_hash(events)
-    if activity_hash == state.get("last_monitoring_hash"):
-        agent_log("monitor", "decision", wid, route="no_github_delta")
-        agent_log("monitor", "end", wid, monitoring_changed=False)
-        return {
-            "last_monitoring_hash": activity_hash,
-            "monitoring_changed": False,
-        }
-
-    task_lookup = {str(task.get("id") or ""): idx for idx, task in enumerate(tasks)}
+    del wid  # parity with existing call signature
     updates: List[Dict[str, Any]] = []
     new_actions: List[Dict[str, Any]] = []
     status_changed = False
     blocker_count = 0
+    workspace_members = list(state.get("team") or [])
 
     for event in events:
         event_id = str(event.get("id") or event.get("event_id") or "")
         if event_id and event_id in processed_event_ids:
             continue
 
-        task_id = map_commit_to_task(event, tasks)
+        task_id = map_commit_to_task_ai(event, tasks)
         if not task_id or task_id not in task_lookup:
             if event_id:
                 noop: Dict[str, Any] = {
@@ -1077,21 +1139,12 @@ def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
             continue
 
         idx = task_lookup[task_id]
+        task = tasks[idx]
         kanban_hint = dict(state.get("kanban") or {})
-        previous_status = str(tasks[idx].get("status") or kanban_hint.get(task_id) or "todo")
-        message = (event.get("message") or event.get("title") or "").lower()
-        task_status = "in_progress"
-
-        if event.get("type") == "pull_request" and event.get("merged"):
-            task_status = "done"
-        elif "fix" in message or "done" in message or "complete" in message:
-            task_status = "done"
-        elif "wip" in message or "progress" in message:
-            task_status = "in_progress"
-        elif "error" in message or "fail" in message or "blocked" in message:
-            task_status = "blocked"
-
+        previous_status = str(task.get("status") or kanban_hint.get(task_id) or "todo")
+        task_status = infer_task_status_ai(event, task)
         actor = event.get("user") or "A contributor"
+
         base_update = {
             "type": "update_task",
             "task_id": task_id,
@@ -1117,7 +1170,7 @@ def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 "source_event_id": event_id,
                 "blocker": {
                     "task_id": task_id,
-                    "task_title": tasks[idx].get("title"),
+                    "task_title": task.get("title"),
                     "message": event.get("message") or event.get("title") or "Task blocked by GitHub activity",
                     "event_id": event_id,
                     "severity": "high",
@@ -1128,6 +1181,99 @@ def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
             blocker["created_at"] = _utc_now_iso()
             new_actions.append(blocker)
             blocker_count += 1
+
+            gh_issue = make_github_issue_action(
+                task_id=task_id,
+                title=f"[Blocker] {task.get('title', task_id)}",
+                body=(
+                    f"GitHub event blocked this task.\n\n"
+                    f"**Event:** {event.get('message') or event.get('title')}\n"
+                    f"**Actor:** {actor}\n"
+                    f"**Event ID:** {event_id}"
+                ),
+                labels=["blocker", "auto-detected"],
+                priority="high",
+            )
+            gh_issue["action_id"] = _stable_hash(gh_issue)
+            gh_issue["created_at"] = _utc_now_iso()
+            new_actions.append(gh_issue)
+
+            recipient_ids = [str(m.get("user_id") or m.get("id") or "") for m in workspace_members]
+            recipient_ids = [r for r in recipient_ids if r]
+            if recipient_ids:
+                notif = make_notification_action(
+                    recipient_ids=recipient_ids,
+                    message=(
+                        f"Task blocked: {task.get('title', task_id)} "
+                        f"\u2014 {event.get('message') or event.get('title')}"
+                    ),
+                    event_type="blocker",
+                    priority="high",
+                )
+                notif["action_id"] = _stable_hash(notif)
+                notif["created_at"] = _utc_now_iso()
+                new_actions.append(notif)
+
+        if previous_status != task_status:
+            kanban_move = make_kanban_move_action(
+                task_id=task_id,
+                new_status=task_status,
+                priority="high" if task_status in ("done", "blocked") else "medium",
+            )
+            kanban_move["action_id"] = _stable_hash(kanban_move)
+            kanban_move["created_at"] = _utc_now_iso()
+            new_actions.append(kanban_move)
+
+    return updates, new_actions, status_changed, blocker_count
+
+
+def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Observe GitHub activity and enqueue Phase 4 pending_actions (execution_node applies them).
+    """
+    wid = str(state.get("workspace_id") or "")
+    agent_log("monitor", "start", wid, events=len(state.get("github_events") or []))
+    if state.get("project_complete"):
+        agent_log("monitor", "decision", wid, route="project_complete_skip")
+        agent_log("monitor", "end", wid, monitoring_changed=False)
+        return {"monitoring_changed": False}
+
+    github_repo = state.get("github_repo") or {}
+    tasks = [dict(task) for task in state.get("tasks") or []]
+    _ensure_task_ids(tasks)
+    processed_event_ids = set(state.get("processed_event_ids") or [])
+    pending_actions = list(state.get("pending_actions") or [])
+
+    events = list(state.get("github_events") or [])
+    commits = [event for event in events if event.get("type") == "commit"]
+    pull_requests = [event for event in events if event.get("type") == "pull_request"]
+
+    if not events and github_repo.get("access_token") and github_repo.get("repo_owner") and github_repo.get("repo_name"):
+        _, commits, pull_requests = fetch_github_activity(
+            github_repo["repo_owner"],
+            github_repo["repo_name"],
+            github_repo["access_token"],
+        )
+        events = [*commits, *pull_requests]
+
+    activity_hash = _stable_hash(events)
+    if activity_hash == state.get("last_monitoring_hash"):
+        agent_log("monitor", "decision", wid, route="no_github_delta")
+        agent_log("monitor", "end", wid, monitoring_changed=False)
+        return {
+            "last_monitoring_hash": activity_hash,
+            "monitoring_changed": False,
+        }
+
+    task_lookup = {str(task.get("id") or ""): idx for idx, task in enumerate(tasks)}
+    updates, new_actions, status_changed, blocker_count = _monitoring_node_event_loop(
+        events=events,
+        tasks=tasks,
+        task_lookup=task_lookup,
+        processed_event_ids=processed_event_ids,
+        state=state,
+        wid=wid,
+    )
 
     merged_pending = [*pending_actions, *new_actions]
     if len(merged_pending) > 200:
@@ -1151,6 +1297,27 @@ def monitoring_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "monitoring_changed": changed,
         "last_github_activity_at": last_gh,
     }
+
+
+def _maybe_schedule_review(state: Dict[str, Any], health: Dict[str, Any], pending_actions: List[Dict[str, Any]]) -> None:
+    """
+    If delay_probability > 0.7, enqueue a calendar review action.
+    """
+    if float(health.get("delay_probability") or 0.0) <= 0.70:
+        return
+    action = make_calendar_review_action(
+        workspace_id=str(state.get("workspace_id") or ""),
+        summary="Project risk review - high delay probability",
+        description=(
+            f"Automated alert: delay_probability={float(health['delay_probability']):.0%}, "
+            f"risk_score={float(health.get('risk_score', 0)):.0%}. "
+            "Please review blockers and dependencies."
+        ),
+        priority="high",
+    )
+    action["action_id"] = _stable_hash(action)
+    action["created_at"] = _utc_now_iso()
+    pending_actions.append(action)
 
 
 def _parse_iso(ts: str) -> datetime | None:

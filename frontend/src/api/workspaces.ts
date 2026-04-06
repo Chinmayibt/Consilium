@@ -182,7 +182,6 @@ export async function fetchWorkspaceRoadmap(
 }
 
 export interface KanbanColumn {
-  backlog: RoadmapTask[];
   todo: RoadmapTask[];
   in_progress: RoadmapTask[];
   review: RoadmapTask[];
@@ -191,7 +190,6 @@ export interface KanbanColumn {
 }
 
 const emptyKanban = (): KanbanColumn => ({
-  backlog: [],
   todo: [],
   in_progress: [],
   review: [],
@@ -215,6 +213,18 @@ export interface UpdateWorkspaceTaskPayload {
   status?: string;
   priority?: string;
   deadline?: string;
+  title?: string;
+  description?: string;
+  assigned_to?: string;
+}
+
+export interface CreateWorkspaceTaskPayload {
+  title: string;
+  description?: string;
+  status?: string;
+  priority?: string;
+  deadline?: string;
+  assigned_to?: string;
 }
 
 export async function updateWorkspaceTaskStatus(
@@ -222,8 +232,20 @@ export async function updateWorkspaceTaskStatus(
   taskId: string,
   payload: UpdateWorkspaceTaskPayload,
 ): Promise<{ task: RoadmapTask }> {
+  const encoded = encodeURIComponent(taskId);
   const { data } = await api.patch<{ task: RoadmapTask }>(
-    `/api/workspaces/${workspaceId}/tasks/${taskId}`,
+    `/api/workspaces/${workspaceId}/tasks/${encoded}`,
+    payload,
+  );
+  return data;
+}
+
+export async function createWorkspaceTask(
+  workspaceId: string,
+  payload: CreateWorkspaceTaskPayload,
+): Promise<{ task: RoadmapTask }> {
+  const { data } = await api.post<{ task: RoadmapTask }>(
+    `/api/workspaces/${workspaceId}/tasks`,
     payload,
   );
   return data;

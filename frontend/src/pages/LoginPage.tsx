@@ -36,7 +36,7 @@ export default function LoginPage() {
     try {
       setLoading(true);
       const res = await login(values.email, values.password);
-      setAuth(res.user, res.access_token);
+      setAuth(res.user, res.access_token, res.refresh_token);
       toast.success("Signed in successfully");
       navigate("/workspaces");
     } catch (err: any) {

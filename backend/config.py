@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     JWT_SECRET: str = Field(..., env="JWT_SECRET")
     JWT_REFRESH_SECRET: str = Field(..., env="JWT_REFRESH_SECRET")
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 300
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     GROQ_REQUIREMENTS_API_KEY: str = Field(..., env="GROQ_REQUIREMENTS_API_KEY")
     GROQ_PLANNING_API_KEY: str = Field(..., env="GROQ_PLANNING_API_KEY")

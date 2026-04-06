@@ -14,7 +14,12 @@ from ..agents.planning_agent import run_planning_agent
 from ..database import get_db
 from ..dependencies import ensure_workspace_access, get_current_user
 from ..services.notification_service import trim_activity_log, trim_notifications
-from ..services.kanban_service import KANBAN_STATUSES, build_kanban
+from ..services.kanban_service import (
+    KANBAN_STATUSES,
+    build_kanban,
+    ensure_task_ids,
+    find_task_index,
+)
 from ..services.planning_history_retrieval import retrieve_similar_task_evidence
 
 
@@ -491,7 +496,9 @@ async def get_workspace_kanban(
     workspace = await workspaces.find_one({"_id": oid})
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
-    tasks = workspace.get("tasks") or []
+    tasks = list(workspace.get("tasks") or [])
+    if ensure_task_ids(tasks):
+        await workspaces.update_one({"_id": oid}, {"$set": {"tasks": tasks}})
     members_raw = workspace.get("members") or []
     members = await _enrich_members_from_users(members_raw)
     tasks = _enrich_tasks_with_members(tasks, members)
@@ -503,10 +510,65 @@ class UpdateWorkspaceTaskRequest(BaseModel):
     status: str | None = None
     priority: str | None = None
     deadline: str | None = None
+    title: str | None = None
+    description: str | None = None
+    assigned_to: str | None = None
+
+
+class CreateWorkspaceTaskRequest(BaseModel):
+    title: str
+    description: str | None = None
+    status: str | None = "todo"
+    priority: str | None = "medium"
+    deadline: str | None = None
+    assigned_to: str | None = None
 
 
 class TaskResponse(BaseModel):
     task: Dict[str, Any]
+
+
+@router.post(
+    "/{workspace_id}/tasks",
+    response_model=TaskResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_workspace_task(
+    workspace_id: str,
+    payload: CreateWorkspaceTaskRequest,
+    current_user=Depends(get_current_user),
+) -> TaskResponse:
+    """Create a task on the workspace Kanban (member or admin)."""
+    db = get_db()
+    workspaces = db["workspaces"]
+    workspace = await ensure_workspace_access(workspace_id, current_user, min_role="member")
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+    st = (payload.status or "todo").lower()
+    if st not in KANBAN_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status; use one of: {KANBAN_STATUSES}")
+    tasks = list(workspace.get("tasks") or [])
+    ensure_task_ids(tasks)
+    new_task: Dict[str, Any] = {
+        "id": str(ObjectId()),
+        "title": title,
+        "description": (payload.description or "").strip(),
+        "status": st,
+        "priority": (payload.priority or "medium").lower(),
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+    if payload.deadline is not None:
+        new_task["deadline"] = payload.deadline
+    if payload.assigned_to is not None:
+        new_task["assigned_to"] = payload.assigned_to
+    tasks.append(new_task)
+    await workspaces.update_one({"_id": workspace["_id"]}, {"$set": {"tasks": tasks}})
+    members_raw = workspace.get("members") or []
+    members = await _enrich_members_from_users(members_raw)
+    enriched = _enrich_tasks_with_members([new_task], members)
+    return TaskResponse(task=enriched[0] if enriched else new_task)
 
 
 @router.patch(
@@ -520,33 +582,35 @@ async def update_workspace_task(
     payload: UpdateWorkspaceTaskRequest,
     current_user=Depends(get_current_user),
 ) -> TaskResponse:
-    """Update a workspace task (status, priority, deadline). Used for drag-and-drop Kanban."""
+    """Update a workspace task (status, fields). Used for Kanban drag-and-drop and edits."""
     db = get_db()
     workspaces = db["workspaces"]
-    try:
-        oid = ObjectId(workspace_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid workspace id")
-    workspace = await workspaces.find_one({"_id": oid})
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+    workspace = await ensure_workspace_access(workspace_id, current_user, min_role="member")
     tasks = list(workspace.get("tasks") or [])
-    task_index = next((i for i, t in enumerate(tasks) if str(t.get("id")) == str(task_id)), None)
-    if task_index is None:
-        task_index = next((i for i, t in enumerate(tasks) if (t.get("title") or "").strip() == (task_id or "").strip()), None)
+    ensure_task_ids(tasks)
+    task_index = find_task_index(tasks, task_id)
     if task_index is None:
         raise HTTPException(status_code=404, detail="Task not found")
     if payload.status is not None:
-        status = payload.status.lower()
-        if status not in KANBAN_STATUSES and status != "blocked":
+        st = payload.status.lower()
+        if st not in KANBAN_STATUSES:
             raise HTTPException(status_code=400, detail=f"Invalid status; use one of: {KANBAN_STATUSES}")
-        tasks[task_index]["status"] = status
+        tasks[task_index]["status"] = st
     if payload.priority is not None:
-        tasks[task_index]["priority"] = payload.priority
+        tasks[task_index]["priority"] = str(payload.priority).lower()
     if payload.deadline is not None:
         tasks[task_index]["deadline"] = payload.deadline
+    if payload.title is not None:
+        t = payload.title.strip()
+        if not t:
+            raise HTTPException(status_code=400, detail="Task title cannot be empty")
+        tasks[task_index]["title"] = t
+    if payload.description is not None:
+        tasks[task_index]["description"] = payload.description
+    if payload.assigned_to is not None:
+        tasks[task_index]["assigned_to"] = payload.assigned_to
     tasks[task_index]["updated_at"] = datetime.utcnow().isoformat()
-    await workspaces.update_one({"_id": oid}, {"$set": {"tasks": tasks}})
+    await workspaces.update_one({"_id": workspace["_id"]}, {"$set": {"tasks": tasks}})
     updated = dict(tasks[task_index])
     members_raw = workspace.get("members") or []
     members = await _enrich_members_from_users(members_raw)

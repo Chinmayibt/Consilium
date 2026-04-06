@@ -5,7 +5,9 @@ import type { UserProfile } from "@/api/auth";
 interface AuthState {
   user: UserProfile | null;
   accessToken: string | null;
-  setAuth: (user: UserProfile, accessToken: string) => void;
+  refreshToken: string | null;
+  setAuth: (user: UserProfile, accessToken: string, refreshToken: string) => void;
+  setAccessToken: (accessToken: string) => void;
   clearAuth: () => void;
 }
 
@@ -14,8 +16,10 @@ export const useAuthStore = create<AuthState>()(
     (set) => ({
       user: null,
       accessToken: null,
-      setAuth: (user, accessToken) => set({ user, accessToken }),
-      clearAuth: () => set({ user: null, accessToken: null }),
+      refreshToken: null,
+      setAuth: (user, accessToken, refreshToken) => set({ user, accessToken, refreshToken }),
+      setAccessToken: (accessToken) => set({ accessToken }),
+      clearAuth: () => set({ user: null, accessToken: null, refreshToken: null }),
     }),
     {
       name: "consilium-auth",
